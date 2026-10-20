@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+recursive-include octoprint_systemimagebackup/templates *
+recursive-include octoprint_systemimagebackup/static *
+recursive-include octoprint_systemimagebackup/helper *
