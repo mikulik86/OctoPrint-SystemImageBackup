@@ -63,7 +63,7 @@ UUID=1234-ABCD  /mnt/backup  ext4  defaults,nofail  0 2
    https://github.com/mikulik86/OctoPrint-SystemImageBackup/archive/refs/heads/main.zip
    ```
 
-   To update the plugin later, install from the same URL again.
+   New releases show up in OctoPrint's **Software Update** like any other plugin.
 2. Open the new **Image Backup** tab. It shows a *One-time setup needed* box.
 3. Click **Install helper**. On a standard OctoPi this works directly from the browser, because
    the `pi` user can use sudo without a password there. If it can't, the tab shows the exact
@@ -203,6 +203,12 @@ Your image files are never touched.
   be incomplete. The tab says so; recreate it from scratch next time. Use *new image every
   time* with *keep 2* or more if you want a safety net.
 - The backup runs at most 6 hours before systemd stops it. OctoPrint is restarted in any case.
+
+## Changelog
+
+- **0.4.0** – First release on GitHub. Full system images to a USB drive or an SMB or NFS
+  share, progress on the Pi's screen, start from OctoDash, `README.txt` and log file next
+  to the images, update notifications through OctoPrint's Software Update.
 
 ## Credits and license
 

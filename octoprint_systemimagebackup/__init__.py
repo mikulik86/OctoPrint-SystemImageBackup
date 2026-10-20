@@ -979,6 +979,21 @@ class SystemImageBackupPlugin(
 
         threading.Thread(target=run, name="imagebackup-install", daemon=True).start()
 
+    # ------------------------------------------------------- software update
+
+    def get_update_information(self):
+        return {
+            "systemimagebackup": {
+                "displayName": "System Image Backup",
+                "displayVersion": self._plugin_version,
+                "type": "github_release",
+                "user": "mikulik86",
+                "repo": "OctoPrint-SystemImageBackup",
+                "current": self._plugin_version,
+                "pip": "https://github.com/mikulik86/OctoPrint-SystemImageBackup/archive/{target_version}.zip",
+            }
+        }
+
 
 __plugin_name__ = "System Image Backup"
 __plugin_pythoncompat__ = ">=3.7,<4"
@@ -991,4 +1006,5 @@ def __plugin_load__():
     global __plugin_hooks__
     __plugin_hooks__ = {
         "octoprint.comm.protocol.atcommand.queuing": __plugin_implementation__.on_atcommand_queuing,
+        "octoprint.plugin.softwareupdate.check_config": __plugin_implementation__.get_update_information,
     }
