@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System image backup</title>
+<style>
+    :root {
+        --bg: #353b48;
+        --card: #2f3640;
+        --text: #f5f6fa;
+        --muted: #a4abb6;
+        --ok: #44bd32;
+        --err: #e84118;
+        --warn: #fbc531;
+        --info: #00a8ff;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Montserrat", "Helvetica Neue", Arial, sans-serif;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+    body {
+        display: flex;
+        flex-direction: column;
+        padding: 18px 22px;
+        gap: 14px;
+        font-size: 17px;
+    }
+    h1 {
+        margin: 0;
+        font-size: 24px;
+        font-weight: 600;
+        padding-right: 40px;
+    }
+    .card {
+        background: var(--card);
+        border-radius: 10px;
+        padding: 14px 18px;
+        line-height: 1.5;
+    }
+    .row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+    .label { color: var(--muted); min-width: 110px; }
+    .badge {
+        display: inline-block;
+        padding: 1px 10px;
+        border-radius: 12px;
+        font-weight: 600;
+        font-size: 15px;
+        color: #1e1e1e;
+    }
+    .b-success { background: var(--ok); }
+    .b-failed { background: var(--err); color: #fff; }
+    .b-interrupted, .b-running { background: var(--warn); }
+    .muted { color: var(--muted); }
+    .msg { margin-top: 4px; }
+    .err { color: #ff8a73; }
+    .okc { color: var(--ok); }
+    .path { word-break: break-all; font-size: 15px; }
+    .actions { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
+    button {
+        font: inherit;
+        font-size: 21px;
+        font-weight: 600;
+        border: 0;
+        border-radius: 10px;
+        padding: 16px 20px;
+        color: #fff;
+        background: var(--info);
+        width: 100%;
+    }
+    button:disabled { opacity: 0.4; }
+    button.secondary { background: #57606f; }
+    .hint { color: var(--muted); font-size: 15px; text-align: center; min-height: 1.2em; }
+    .spinner {
+        display: inline-block;
+        width: 18px;
+        height: 18px;
+        border: 3px solid rgba(255, 255, 255, 0.25);
+        border-top-color: var(--text);
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        vertical-align: -3px;
+        margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #confirm {
+        position: fixed;
+        inset: 0;
+        background: rgba(20, 22, 28, 0.92);
+        display: none;
+        flex-direction: column;
+        justify-content: center;
+        padding: 30px;
+        gap: 16px;
+        text-align: center;
+    }
+    #confirm.show { display: flex; }
+    #confirm p { margin: 0 0 8px 0; line-height: 1.5; }
+    .two { display: flex; gap: 12px; }
+</style>
+</head>
+<body>
+    <h1>System image backup</h1>
+
+    <div class="card" id="state">
+        <span class="spinner"></span> Loading&hellip;
+    </div>
+
+    <div class="card" id="target" style="display: none"></div>
+
+    <div class="actions">
+        <button id="start" disabled>Start backup</button>
+        <div class="hint" id="hint"></div>
+    </div>
+
+    <div id="confirm">
+        <p><strong>Start the backup now?</strong></p>
+        <p class="muted">OctoPrint stops while the backup runs and starts again when it is done.
+            The first backup takes longest. Do not switch off the printer or the Pi.</p>
+        <div class="two">
+            <button id="yes">Start backup</button>
+            <button id="no" class="secondary">Cancel</button>
+        </div>
+    </div>
+
+<script>
+(function () {
+    "use strict";
+    var token = new URLSearchParams(location.search).get("token") || "";
+    var base = location.pathname.replace(/\/+$/, "");
+    var q = "?token=" + encodeURIComponent(token);
+    var $ = function (id) { return document.getElementById(id); };
+    var last = null, offline = false, starting = false, startedAt = 0, startError = "";
+
+    function esc(s) {
+        return String(s === null || s === undefined ? "" : s)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+    function size(b) {
+        if (!b && b !== 0) return "";
+        return b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : (b / 1e6).toFixed(0) + " MB";
+    }
+    function ago(ts) {
+        if (!ts) return "";
+        var s = Math.max(0, Date.now() / 1000 - ts), d = new Date(ts * 1000);
+        var rel = s < 90 ? "just now"
+            : s < 5400 ? Math.round(s / 60) + " min ago"
+            : s < 129600 ? Math.round(s / 3600) + " h ago"
+            : Math.round(s / 86400) + " days ago";
+        return rel + " (" + d.toLocaleDateString() + " " + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) + ")";
+    }
+    function duration(s) {
+        if (!s) return "";
+        var m = Math.floor(s / 60);
+        return m >= 60 ? Math.floor(m / 60) + " h " + (m % 60) + " min" : m > 0 ? m + " min" : s + " s";
+    }
+
+    function render(st) {
+        var html = "", startBlock = null;
+        if (offline) {
+            $("state").innerHTML = '<span class="spinner"></span><strong>OctoPrint is offline.</strong>' +
+                '<div class="msg muted">The backup is probably running. This page updates when OctoPrint is back.</div>';
+            $("target").style.display = "none";
+            $("start").disabled = true;
+            $("hint").textContent = "";
+            return;
+        }
+        if (!st) return;
+        last = st.last;
+
+        if (st.running || (starting && Date.now() - startedAt < 60000)) {
+            html = '<span class="spinner"></span><strong>Backup running&hellip;</strong>' +
+                '<div class="msg muted">OctoPrint stops in a moment and comes back when the backup is done.</div>';
+            startBlock = "A backup is running.";
+        } else if (last) {
+            var names = {success: "Success", failed: "Failed", interrupted: "Interrupted", running: "Running"};
+            html = '<div class="row"><span class="label">Last backup</span><span class="badge b-' + esc(last.state) + '">' +
+                esc(names[last.state] || last.state) + '</span> <span>' + esc(ago(last.finished || last.started)) + '</span></div>';
+            if (last.message) html += '<div class="msg' + (last.state === "success" ? "" : " err") + '">' + esc(last.message) + '</div>';
+            if (last.image && last.state === "success") {
+                html += '<div class="row"><span class="label">Image</span><span class="path">' + esc(last.image) +
+                    (last.image_size ? " &middot; " + esc(size(last.image_size)) : "") +
+                    (last.duration ? " &middot; " + esc(duration(last.duration)) : "") + '</span></div>';
+            }
+        } else {
+            html = '<span class="muted">No backup has been made yet.</span>';
+        }
+        $("state").innerHTML = html;
+
+        var t = st.target, th = "";
+        if (!st.ready) {
+            th = '<div class="err">Setup is not complete. Open the Image Backup tab in OctoPrint.</div>';
+            (st.problems || []).forEach(function (p) { th += '<div class="muted">' + esc(p) + '</div>'; });
+            startBlock = startBlock || "Finish the setup in OctoPrint first.";
+        } else if (t) {
+            th = '<div class="row"><span class="label">Destination</span><span class="path">' + esc(t.path) + '</span></div>';
+            if (t.ok && t.network) {
+                th += '<div class="okc">Network share &middot; connected when the backup starts' +
+                    (t.checked_at && t.free ? " &middot; " + esc(size(t.free)) + " free at last check" : "") + '</div>';
+            } else if (t.ok) {
+                th += '<div class="okc">Ready' + (t.free !== null ? " &middot; " + esc(size(t.free)) + " free" : "") +
+                    (t.creates ? " &middot; creates a new image" : " &middot; updates the existing image") + '</div>';
+            } else {
+                th += '<div class="err">' + esc(t.message) + '</div>';
+                startBlock = startBlock || "Fix the destination first.";
+            }
+        }
+        $("target").innerHTML = th;
+        $("target").style.display = th ? "" : "none";
+
+        if (!startBlock && st.printer_busy) startBlock = "The printer is busy.";
+        $("start").disabled = !!startBlock;
+        $("hint").textContent = startBlock || startError;
+        $("hint").className = !startBlock && startError ? "hint err" : "hint";
+    }
+
+    function poll() {
+        fetch(base + "/status" + q, {cache: "no-store"})
+            .then(function (r) {
+                if (r.status === 403) throw new Error("forbidden");
+                return r.json();
+            })
+            .then(function (st) {
+                offline = false;
+                if (st.running) starting = false;
+                if (starting && st.last && st.last.started && st.last.started * 1000 >= startedAt - 5000 && st.last.state !== "running") {
+                    starting = false;   // finished or failed during the checks
+                }
+                render(st);
+            })
+            .catch(function (e) {
+                if (e && e.message === "forbidden") {
+                    $("state").innerHTML = '<div class="err">This link is no longer valid. Copy the new Custom Action from the Image Backup tab in OctoPrint.</div>';
+                    $("start").disabled = true;
+                    return;
+                }
+                offline = true;
+                render(null);
+            })
+            .then(function () { setTimeout(poll, offline ? 4000 : 3000); });
+    }
+
+    $("start").addEventListener("click", function () { startError = ""; $("confirm").classList.add("show"); });
+    $("no").addEventListener("click", function () { $("confirm").classList.remove("show"); });
+    $("yes").addEventListener("click", function () {
+        $("confirm").classList.remove("show");
+        $("start").disabled = true;
+        $("hint").textContent = "Starting...";
+        fetch(base + "/start" + q, {method: "POST"})
+            .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, body: j}; }); })
+            .then(function (res) {
+                if (res.ok) {
+                    starting = true;
+                    startedAt = Date.now();
+                    $("hint").textContent = res.body.message || "Backup started.";
+                } else {
+                    startError = "Not started: " + (res.body.error || "unknown error");
+                    $("hint").textContent = startError;
+                    $("hint").className = "hint err";
+                    $("start").disabled = false;
+                }
+            })
+            .catch(function () {
+                $("hint").textContent = "Could not reach OctoPrint.";
+                $("start").disabled = false;
+            });
+    });
+
+    poll();
+})();
+</script>
+</body>
+</html>
