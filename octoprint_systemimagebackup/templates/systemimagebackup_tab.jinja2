@@ -1,0 +1,348 @@
+<div class="sib">
+    <div class="alert" data-bind="visible: !isAdmin()">
+        Only administrators can use the system image backup.
+    </div>
+
+    <div data-bind="visible: isAdmin()" style="display: none">
+
+        <!-- ============================================================ setup -->
+        <div class="alert alert-block sib-setup" data-bind="visible: setupNeeded" style="display: none">
+            <h4>One-time setup needed</h4>
+            <ul data-bind="foreach: setupProblems">
+                <li data-bind="text: $data"></li>
+            </ul>
+
+            <div data-bind="visible: install.running" style="display: none">
+                <p><i class="fas fa-spinner fa-spin"></i> Installing the helper&hellip; this can take a minute.</p>
+            </div>
+
+            <div data-bind="visible: !install.running()">
+                <div data-bind="visible: canInstallFromUi">
+                    <p>
+                        <button class="btn btn-primary" data-bind="click: installHelper, enable: !install.running()">
+                            <i class="fas fa-download"></i> <span data-bind="text: helperInstalled() ? 'Update helper' : 'Install helper'"></span>
+                        </button>
+                    </p>
+                    <p class="sib-small" data-bind="visible: needsImageUtils">
+                        This also downloads image-utils (RonR's image-backup scripts) from a pinned,
+                        checksum-verified GitHub mirror.
+                    </p>
+                    <p class="sib-small">Or run this over SSH:</p>
+                </div>
+                <p data-bind="visible: !canInstallFromUi()">
+                    OctoPrint's user cannot use sudo without a password on this system, so the setup has to be run
+                    over SSH:
+                </p>
+                <div class="sib-cmd">
+                    <pre data-bind="text: installCommand"></pre>
+                    <button class="btn btn-mini" data-bind="click: function() { copy(installCommand()) }" title="Copy">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <button class="btn btn-small" data-bind="click: refresh"><i class="fas fa-sync"></i> Check again</button>
+            </div>
+
+            <div data-bind="visible: install.output" style="display: none">
+                <p class="sib-small" data-bind="text: install.rc() === 0 ? 'Installation output:' : 'Installation failed (exit code ' + install.rc() + '):'"></p>
+                <pre class="sib-log" data-bind="text: install.output"></pre>
+            </div>
+        </div>
+
+        <div class="alert alert-success" data-bind="visible: !setupNeeded() && install.rc() === 0 && install.output()" style="display: none">
+            Helper installed. <a href="#" data-bind="click: dismissInstall">Hide</a>
+        </div>
+
+        <!-- ========================================================== status -->
+        <h4>
+            Last backup
+            <a href="#" class="sib-refresh" data-bind="click: refresh" title="Refresh"><i class="fas fa-sync" data-bind="css: { 'fa-spin': loading }"></i></a>
+        </h4>
+
+        <div class="alert alert-info" data-bind="visible: running() || waitingForStart()" style="display: none">
+            <i class="fas fa-spinner fa-spin"></i>
+            <strong>Backup running.</strong>
+            OctoPrint stops in a moment and this page reconnects when the backup is done.
+        </div>
+
+        <div data-bind="visible: !last() && !running()">
+            <p class="muted">No backup has been made with this plugin yet.</p>
+        </div>
+
+        <table class="table table-condensed sib-status" data-bind="visible: last" style="display: none">
+            <tbody>
+                <tr>
+                    <th>Result</th>
+                    <td>
+                        <span class="label" data-bind="css: resultCss, text: resultText"></span>
+                        <span data-bind="text: last() ? last().message : ''"></span>
+                    </td>
+                </tr>
+                <tr data-bind="visible: last() && last().finished">
+                    <th>Finished</th>
+                    <td data-bind="text: last() ? fmtDate(last().finished) : ''"></td>
+                </tr>
+                <tr data-bind="visible: last() && last().duration">
+                    <th>Duration</th>
+                    <td data-bind="text: last() ? fmtDuration(last().duration) : ''"></td>
+                </tr>
+                <tr data-bind="visible: last() && last().image && last().state === 'success'">
+                    <th>Image</th>
+                    <td>
+                        <code data-bind="text: last() ? last().image : ''"></code>
+                        <span data-bind="visible: last() && last().image_size, text: last() && last().image_size ? '(' + fmtSize(last().image_size) + ')' : ''"></span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p data-bind="visible: log">
+            <a href="#" data-bind="click: function() { showLog(!showLog()) }">
+                <i class="fas" data-bind="css: { 'fa-caret-right': !showLog(), 'fa-caret-down': showLog }"></i>
+                Log of the last backup
+            </a>
+        </p>
+        <pre class="sib-log" data-bind="visible: showLog() && log(), text: log" style="display: none"></pre>
+
+        <!-- =========================================================== start -->
+        <div class="sib-start">
+            <button class="btn btn-primary btn-large" data-bind="enable: canStart, click: startBackup">
+                <i class="fas fa-hdd"></i> Start backup now
+            </button>
+            <label class="checkbox sib-fresh" data-bind="visible: mode() === 'update' && imageExists()" style="display: none">
+                <input type="checkbox" data-bind="checked: fresh"> Recreate the image from scratch this time
+            </label>
+            <div class="sib-small sib-start-hint" data-bind="text: startHint"></div>
+        </div>
+
+        <!-- ======================================================== settings -->
+        <h4>Settings</h4>
+        <form class="form-horizontal sib-settings" data-bind="submit: saveSettings">
+            <div class="control-group">
+                <label class="control-label">Destination</label>
+                <div class="controls">
+                    <select class="input-xlarge" data-bind="value: destType">
+                        <option value="local">USB drive or mounted folder</option>
+                        <option value="smb">SMB share (Windows, NAS)</option>
+                        <option value="nfs">NFS share</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- local folder -->
+            <div class="control-group" data-bind="visible: destType() === 'local'">
+                <label class="control-label">Folder</label>
+                <div class="controls">
+                    <input type="text" class="input-xlarge" data-bind="value: destination, valueUpdate: 'input'" placeholder="/mnt/backup">
+                    <span class="help-block">
+                        A USB drive (or a share you mount yourself) under <code>/mnt</code> or <code>/media</code>.
+                        Not a folder on the SD card itself.
+                    </span>
+                </div>
+            </div>
+
+            <!-- network share -->
+            <div data-bind="visible: destType() !== 'local'" style="display: none">
+                <div class="control-group">
+                    <label class="control-label" data-bind="text: destType() === 'nfs' ? 'Export' : 'Share'">Share</label>
+                    <div class="controls">
+                        <input type="text" class="input-xlarge" data-bind="value: netShare, valueUpdate: 'input', attr: { placeholder: destType() === 'nfs' ? 'nas.local:/volume1/backup' : '//nas.local/backup' }">
+                        <span class="help-block" data-bind="visible: destType() === 'smb'">
+                            <code>//server/share</code> - <code>\\server\share</code> works too. The server name or IP address.
+                        </span>
+                        <span class="help-block" data-bind="visible: destType() === 'nfs'">
+                            <code>server:/path/of/export</code>. The server must allow root from this Pi to write
+                            (<code>no_root_squash</code>, or root mapped to a user with write access).
+                        </span>
+                    </div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Folder on the share</label>
+                    <div class="controls">
+                        <input type="text" class="input-large" data-bind="value: netSubdir, valueUpdate: 'input'" placeholder="optional, e.g. octopi">
+                        <span class="help-block">Created if it does not exist.</span>
+                    </div>
+                </div>
+                <div data-bind="visible: destType() === 'smb'">
+                    <div class="control-group">
+                        <label class="control-label">Username</label>
+                        <div class="controls">
+                            <input type="text" class="input-large" autocomplete="off" data-bind="value: smbUser, valueUpdate: 'input'" placeholder="empty = guest access">
+                        </div>
+                    </div>
+                    <div class="control-group" data-bind="visible: smbUser().trim() !== ''">
+                        <label class="control-label">Password</label>
+                        <div class="controls">
+                            <input type="password" class="input-large" autocomplete="new-password" data-bind="value: smbPassword, valueUpdate: 'input', attr: { placeholder: passwordSaved() ? 'saved - type to change' : '' }">
+                            <span class="help-block">
+                                Stored on the Pi in a file only root can read, not in OctoPrint's settings.
+                            </span>
+                            <span class="help-block text-warning" data-bind="visible: passwordMissing" style="display: none">
+                                <i class="fas fa-exclamation-triangle"></i> Enter the password for this user.
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                <div class="control-group">
+                    <label class="control-label">Mount options</label>
+                    <div class="controls">
+                        <input type="text" class="input-xlarge" data-bind="value: netOptions, valueUpdate: 'input', attr: { placeholder: destType() === 'nfs' ? 'optional, e.g. nfsvers=4.1' : 'optional, e.g. vers=3.0,domain=WORKGROUP' }">
+                        <span class="help-block">Only needed if connecting fails with the defaults.</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- destination status + test -->
+            <div class="control-group">
+                <div class="controls">
+                    <div class="sib-check" data-bind="visible: !dirty() && target() && !testResult()" style="display: none">
+                        <!-- ko if: target() && target().ok && !target().network -->
+                        <span class="text-success">
+                            <i class="fas fa-check"></i>
+                            Mounted<span data-bind="text: target().free !== null ? ', ' + fmtSize(target().free) + ' free' : ''"></span>.
+                        </span>
+                        <!-- /ko -->
+                        <!-- ko if: target() && target().ok && target().network -->
+                        <span class="muted" data-bind="text: networkSummary"></span>
+                        <!-- /ko -->
+                        <!-- ko if: target() && !target().ok -->
+                        <span class="text-error">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <span data-bind="text: target().message"></span>
+                        </span>
+                        <!-- /ko -->
+                    </div>
+                    <div class="sib-check" data-bind="with: testResult">
+                        <!-- ko if: $data.ok -->
+                        <span class="text-success">
+                            <i class="fas fa-check"></i>
+                            <span data-bind="text: $parent.testSummary($data)"></span>
+                        </span>
+                        <div class="text-warning" data-bind="visible: $data.warning, text: $data.warning || ''"></div>
+                        <!-- /ko -->
+                        <!-- ko ifnot: $data.ok -->
+                        <span class="text-error">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <span data-bind="text: $data.message"></span>
+                        </span>
+                        <!-- /ko -->
+                    </div>
+                    <button type="button" class="btn btn-small sib-test" data-bind="visible: destType() !== 'local', click: testDestination, enable: canTest">
+                        <i class="fas" data-bind="css: { 'fa-plug': !testing(), 'fa-spinner fa-spin': testing }"></i>
+                        <span data-bind="text: testing() ? 'Connecting...' : 'Test connection'"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label class="control-label">Backup type</label>
+                <div class="controls">
+                    <label class="radio">
+                        <input type="radio" name="sib-mode" value="update" data-bind="checked: mode">
+                        Keep one image and update it <span class="muted">(fast after the first run)</span>
+                    </label>
+                    <label class="radio">
+                        <input type="radio" name="sib-mode" value="new" data-bind="checked: mode">
+                        Create a new image every time <span class="muted">(slower, keeps older versions)</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label class="control-label">Image name</label>
+                <div class="controls">
+                    <input type="text" class="input-large" data-bind="value: imageName, valueUpdate: 'input'">
+                    <span class="help-block">
+                        File: <code data-bind="text: fileNamePreview"></code>.
+                        Next to it: <code>README.txt</code> with restore instructions and
+                        <code data-bind="text: logNamePreview"></code> with the log of the last backup.
+                    </span>
+                </div>
+            </div>
+
+            <div class="control-group" data-bind="visible: mode() === 'new'">
+                <label class="control-label">Images to keep</label>
+                <div class="controls">
+                    <input type="number" min="0" max="999" class="input-mini" data-bind="value: keep, valueUpdate: 'input'">
+                    <span class="help-block">Older images are deleted after a successful backup. 0 keeps all.</span>
+                </div>
+            </div>
+
+            <div class="control-group" data-bind="visible: mode() === 'update'">
+                <label class="control-label">Room for updates</label>
+                <div class="controls">
+                    <div class="input-append">
+                        <input type="number" min="0" class="input-small" data-bind="value: extraMb, valueUpdate: 'input'">
+                        <span class="add-on">MB</span>
+                    </div>
+                    <span class="help-block">
+                        Free space kept inside the image so later updates fit. If your system grows by more than
+                        this, recreate the image from scratch.
+                    </span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label class="control-label">Also stop</label>
+                <div class="controls">
+                    <input type="text" class="input-xlarge" data-bind="value: stopServices, valueUpdate: 'input'" placeholder="e.g. webcamd">
+                    <span class="help-block">
+                        Services to stop during the backup, besides OctoPrint (space separated).
+                        <span data-bind="visible: suggestions().length">
+                            Running here:
+                            <!-- ko foreach: suggestions -->
+                            <a href="#" class="sib-suggest" data-bind="text: $data, click: $parent.addService"></a>
+                            <!-- /ko -->
+                        </span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label class="control-label">Screen</label>
+                <div class="controls">
+                    <label class="checkbox">
+                        <input type="checkbox" data-bind="checked: showOnScreen">
+                        Show progress on the screen attached to the Pi
+                    </label>
+                    <div data-bind="visible: showOnScreen" class="sib-small">
+                        Uses text console
+                        <input type="number" min="2" max="63" class="input-mini sib-inline" data-bind="value: screenVt, valueUpdate: 'input'">
+                        and switches back to the previous screen (e.g. OctoDash) afterwards.
+                    </div>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label class="control-label">OctoDash</label>
+                <div class="controls">
+                    <p class="sib-small">
+                        Add a Custom Action in OctoDash's settings with this command. It opens a page
+                        with the backup status and a Start button. Works with the printer off.
+                    </p>
+                    <div class="sib-cmd">
+                        <pre data-bind="text: webAction"></pre>
+                        <button type="button" class="btn btn-mini" data-bind="click: function() { copy(webAction()) }"><i class="fas fa-copy"></i> Copy</button>
+                        <button type="button" class="btn btn-mini" data-bind="click: regenerateToken" title="Invalidates the old link"><i class="fas fa-redo"></i> New link</button>
+                    </div>
+                    <label class="checkbox">
+                        <input type="checkbox" data-bind="checked: allowAtCommand">
+                        Also accept <code data-bind="text: atCommand"></code> as a printer command
+                    </label>
+                    <p class="sib-small" data-bind="visible: allowAtCommand">
+                        One-tap alternative: a Custom Action with the command <code data-bind="text: atCommand"></code>
+                        (turn on "Confirm"). Needs the printer to be connected, and errors only show up here.
+                    </p>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <div class="controls">
+                    <button type="submit" class="btn btn-primary" data-bind="enable: dirty() && !saving()">
+                        <i class="fas fa-save"></i> Save settings
+                    </button>
+                    <button type="button" class="btn" data-bind="visible: dirty, click: revertSettings">Undo changes</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
