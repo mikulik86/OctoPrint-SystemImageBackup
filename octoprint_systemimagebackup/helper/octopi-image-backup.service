@@ -1,0 +1,16 @@
+[Unit]
+Description=System image backup for OctoPrint (image-utils)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/octopi-image-backup
+ExecStart=/usr/local/sbin/octopi-image-backup run
+# Runs after the job ends for ANY reason (success, failure, crash, timeout):
+# restarts OctoPrint and the other stopped services and gives the screen back.
+ExecStopPost=/usr/local/sbin/octopi-image-backup recover
+TimeoutStartSec=6h
+TimeoutStopSec=5min
+
+# No [Install] section on purpose: this never runs at boot, only when the plugin starts it.
