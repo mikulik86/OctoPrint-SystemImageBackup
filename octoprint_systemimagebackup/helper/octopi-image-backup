@@ -1,0 +1,1166 @@
+#!/bin/bash
+#
+# octopi-image-backup - root-side helper of the OctoPrint "System Image Backup" plugin.
+#
+# Never started by OctoPrint directly. The plugin asks systemd to start
+# octopi-image-backup.service, which runs:
+#
+#   octopi-image-backup run      (ExecStart)     the backup job
+#   octopi-image-backup recover  (ExecStopPost)  safety net: restarts anything that is
+#                                                still stopped, closes a stale "running"
+#                                                status, unmounts the share and gives the
+#                                                screen back
+#
+# Called by the plugin through sudo (see /etc/sudoers.d/octopi-image-backup):
+#
+#   octopi-image-backup test-destination   mount + check the destination, print KEY=VALUE
+#   octopi-image-backup set-credentials    store the SMB username/password (read from stdin)
+#                                          in a file only root can read
+#
+# The job settings come from the job file written by the plugin. Its path (JOB_FILE) is set in
+# /etc/default/octopi-image-backup, which the installer writes and only root can change. The
+# job file itself is writable by the OctoPrint user, so it is read as plain data and every
+# value is validated. Nothing from it is ever executed.
+
+HELPER_VERSION=6
+
+set -o pipefail
+umask 022
+
+STATE_DIR="${IB_STATE_DIR:-/var/lib/octopi-image-backup}"
+STATUS_FILE="$STATE_DIR/status"
+LOG_FILE="$STATE_DIR/last.log"
+STOPPED_FILE="$STATE_DIR/stopped-services"
+SCREEN_STATE_FILE="$STATE_DIR/screen"
+WORK_STATE_FILE="$STATE_DIR/work-image"
+DEST_INFO_FILE="$STATE_DIR/dest-info"
+NET_MOUNT_FILE="$STATE_DIR/net-mount"
+LOCK_FILE="$STATE_DIR/lock"
+CRED_DIR="${IB_CRED_DIR:-/etc/octopi-image-backup}"
+CRED_FILE="$CRED_DIR/smb-credentials"
+DEFAULTS_FILE="${IB_DEFAULTS_FILE:-/etc/default/octopi-image-backup}"
+JOB_FILE="${JOB_FILE:-}"
+OCTOPRINT_SERVICE="${OCTOPRINT_SERVICE:-octoprint.service}"
+IMG_MNT="/tmp/img-backup-mnt"         # mount point hardcoded in image-backup
+NET_MNT="/mnt/octopi-image-backup"    # network shares are mounted here (image-backup wants /mnt)
+MOUNT_TIMEOUT=60                      # seconds for mounting a share
+OCTOPRINT_WAIT=180                    # seconds to wait for OctoPrint to answer again
+PAUSE_OK=5                            # seconds the final screen stays up after success
+PAUSE_FAIL=30                         # ... and after a failure
+
+# Services that must never be stopped (network, SSH, systemd itself, ...)
+PROTECTED_RE='^(ssh|sshd|dbus|systemd-.*|networking|NetworkManager|dhcpcd|wpa_supplicant|avahi-daemon|rpcbind|nfs-.*|smbd|nmbd|autofs|getty@.*|serial-getty@.*|user@.*|octopi-image-backup)\.service$'
+
+# ---------------------------------------------------------------- state ---
+
+declare -A ST=()
+CMD=""
+FAIL_MSG=""
+BG_PID=""
+CREATE=0
+WORK=""
+FINAL=""
+REAL_DEST=""
+DISPLAY_DEST=""
+DISPLAY_FINAL=""
+SERVICES=()
+OP_STOPPED=0
+SRC_USED_KB=0
+AVAIL_KB=""
+NEED_KB=0
+COPY_SEEN=0
+START_TS=0
+RETENTION_REMOVED=0
+SHARE_MOUNTED=0
+LOCK_FD=""
+DI_EXISTS=0 DI_SIZE="" DI_MTIME="" DI_COUNT=0 DI_FREE=""
+
+# screen
+SCREEN_ON=0
+SCREEN_FD=""
+RETURN_VT=""
+OLD_BLANK=0
+S_CHECK=pending S_STOP=pending S_COPY=pending S_RESTART=pending
+D_STOP="" D_COPY="" D_RESTART="" FOOTER=""
+
+# job values (defaults)
+J_DEST="" J_MODE="update" J_NAME="octopi-backup" J_KEEP=3 J_EXTRA=1024 J_FRESH=0
+J_SERVICES="" J_SCREEN=0 J_VT=8 J_PORT=5000
+J_TYPE="local" J_SHARE="" J_SUBDIR="" J_OPTIONS="" J_AUTH="guest"
+
+# -------------------------------------------------------------- helpers ---
+
+log() {
+    local line
+    line="$(date '+%F %T') $*"
+    case "$CMD" in
+        run|recover)
+            echo "$line"
+            [[ -d "$STATE_DIR" ]] && echo "$line" >> "$LOG_FILE"
+            ;;
+        *)  echo "$line" >&2 ;;   # test-destination / set-credentials: stdout is the result
+    esac
+}
+
+st_write() {
+    local tmp="$STATUS_FILE.tmp.$$" k v
+    {
+        for k in "${!ST[@]}"; do
+            v="${ST[$k]}"
+            v="${v//$'\n'/ }"
+            printf '%s=%s\n' "$k" "$v"
+        done
+    } > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+
+st_load() {
+    local line
+    ST=()
+    [[ -f "$STATUS_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        ST["${line%%=*}"]="${line#*=}"
+    done < "$STATUS_FILE"
+}
+
+fail() {
+    FAIL_MSG="$*"
+    case "$CMD" in
+        test) printf 'ok=0\nmessage=%s\n' "${*//$'\n'/ }" ;;
+        *)    log "ERROR: $*" ;;
+    esac
+    exit 1
+}
+
+fmt_gb() {   # KiB -> "1.23 GB"
+    awk -v k="$1" 'BEGIN { printf "%.2f GB", k / 1024 / 1024 }'
+}
+
+fmt_elapsed() {
+    local s=$1
+    if (( s >= 3600 )); then
+        printf '%d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+    else
+        printf '%02d:%02d' $((s / 60)) $((s % 60))
+    fi
+}
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
+
+# --------------------------------------------------------------- screen ---
+# Progress on a spare text console (VT). OctoDash or whatever is shown keeps running on its
+# own console; we switch the display away and back.
+
+vt_switch() {
+    local n=$1
+    [[ "$n" =~ ^[0-9]+$ ]] || return 0
+    if command -v chvt >/dev/null 2>&1; then
+        timeout 10 chvt "$n" && return 0
+    fi
+    # Fallback without the kbd package: VT_ACTIVATE / VT_WAITACTIVE ioctls
+    timeout 10 python3 -c 'import fcntl, os, sys
+n = int(sys.argv[1]); fd = os.open("/dev/tty0", os.O_RDWR)
+fcntl.ioctl(fd, 0x5606, n); fcntl.ioctl(fd, 0x5607, n)' "$n" 2>/dev/null
+}
+
+mark() {
+    case "$1" in
+        ok)      printf '\033[1;32m[  OK  ]\033[0m' ;;
+        active)  printf '\033[1;33m[ .... ]\033[0m' ;;
+        fail)    printf '\033[1;31m[ FAIL ]\033[0m' ;;
+        warn)    printf '\033[1;33m[ WARN ]\033[0m' ;;
+        skip)    printf '[  --  ]' ;;
+        *)       printf '[      ]' ;;
+    esac
+}
+
+screen_draw() {
+    (( SCREEN_ON )) || return 0
+    local now=$(( $(date +%s) - START_TS )) out
+    local el=$'\033[K\n'
+    out=$'\033[H'
+    out+="$el"
+    out+=$'  \033[1mOctoPrint system image backup\033[0m'"$el"
+    out+="  ================================$el"
+    out+="$el"
+    out+="  $(mark "$S_CHECK")  Checks$el"
+    out+="  $(mark "$S_STOP")  Stop OctoPrint$el"
+    [[ -n "$D_STOP" ]] && out+="              $D_STOP$el"
+    if (( CREATE )); then
+        out+="  $(mark "$S_COPY")  Create image$el"
+    else
+        out+="  $(mark "$S_COPY")  Update image$el"
+    fi
+    [[ -n "$D_COPY" ]] && out+="              $D_COPY$el"
+    out+="  $(mark "$S_RESTART")  Restart OctoPrint$el"
+    [[ -n "$D_RESTART" ]] && out+="              $D_RESTART$el"
+    out+="$el"
+    [[ -n "$DISPLAY_FINAL" ]] && out+="  Image:    ${DISPLAY_FINAL}$el"
+    out+="  Elapsed:  $(fmt_elapsed "$now")$el"
+    out+="$el"
+    [[ -n "$FOOTER" ]] && out+="  $FOOTER$el"
+    out+=$'\033[J'
+    printf '%s' "$out" 1>&"$SCREEN_FD" 2>/dev/null || true
+}
+
+screen_open() {
+    (( J_SCREEN == 1 )) || return 0
+    local dev="${IB_SCREEN_DEV:-/dev/tty$J_VT}"
+    if [[ ! -c "$dev" && -z "${IB_SCREEN_DEV:-}" ]]; then
+        log "Screen: $dev not available, not showing progress on screen"
+        return 0
+    fi
+    RETURN_VT="$(sed -n 's/^tty//p' /sys/class/tty/tty0/active 2>/dev/null)"
+    [[ "$RETURN_VT" =~ ^[0-9]+$ ]] || RETURN_VT=1
+    if ! exec {SCREEN_FD}>"$dev"; then
+        log "Screen: cannot open $dev, not showing progress on screen"
+        return 0
+    fi
+    SCREEN_ON=1
+    OLD_BLANK="$(cat /sys/module/kernel/parameters/consoleblank 2>/dev/null)"
+    [[ "$OLD_BLANK" =~ ^[0-9]+$ ]] || OLD_BLANK=0
+    printf 'SCREEN_VT=%s\nRETURN_VT=%s\nOLD_BLANK=%s\n' "$J_VT" "$RETURN_VT" "$OLD_BLANK" > "$SCREEN_STATE_FILE"
+    # no blanking, no powerdown, hide cursor, clear
+    printf '\033[9;0]\033[14;0]\033[?25l\033[2J' 1>&"$SCREEN_FD" 2>/dev/null || true
+    screen_draw
+    vt_switch "$J_VT" || log "Screen: could not switch to console $J_VT"
+}
+
+screen_restore() {   # fd (or ""), console shown, console to return to, old blank seconds
+    local fd=$1 vt=$2 ret=$3 blank=$4
+    if [[ -n "$fd" ]]; then
+        printf '\033[?25h\033[9;%d]' $(( blank / 60 )) 1>&"$fd" 2>/dev/null || true
+    fi
+    if [[ -n "$ret" && "$ret" != "$vt" ]]; then
+        vt_switch "$ret" || log "Screen: could not switch back to console $ret"
+    fi
+}
+
+screen_close() {
+    (( SCREEN_ON )) || return 0
+    screen_restore "$SCREEN_FD" "$J_VT" "$RETURN_VT" "$OLD_BLANK"
+    exec {SCREEN_FD}>&-
+    SCREEN_ON=0
+    command -v deallocvt >/dev/null 2>&1 && deallocvt "$J_VT" 2>/dev/null
+    rm -f "$SCREEN_STATE_FILE"
+}
+
+# ------------------------------------------------------------------ job ---
+
+read_job() {
+    local line key val
+    [[ -n "$JOB_FILE" ]] || fail "JOB_FILE is not set - reinstall the helper (install.sh)."
+    [[ -L "$JOB_FILE" ]] && fail "Job file $JOB_FILE is a symlink - refusing to read it."
+    [[ -f "$JOB_FILE" ]] || fail "No job file at $JOB_FILE - start the backup from the OctoPrint plugin."
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            DEST_DIR)       J_DEST="$val" ;;
+            MODE)           J_MODE="$val" ;;
+            NAME)           J_NAME="$val" ;;
+            KEEP)           J_KEEP="$val" ;;
+            EXTRA_MB)       J_EXTRA="$val" ;;
+            FRESH)          J_FRESH="$val" ;;
+            STOP_SERVICES)  J_SERVICES="$val" ;;
+            SCREEN)         J_SCREEN="$val" ;;
+            SCREEN_VT)      J_VT="$val" ;;
+            OCTOPRINT_PORT) J_PORT="$val" ;;
+            DEST_TYPE)      J_TYPE="$val" ;;
+            NET_SHARE)      J_SHARE="$val" ;;
+            NET_SUBDIR)     J_SUBDIR="$val" ;;
+            NET_OPTIONS)    J_OPTIONS="$val" ;;
+            SMB_AUTH)       J_AUTH="$val" ;;
+        esac
+    done < "$JOB_FILE"
+}
+
+validate_job() {
+    local s u
+    case "$J_MODE" in update|new) ;; *) fail "Invalid backup type '$J_MODE'." ;; esac
+    J_NAME="${J_NAME%.img}"
+    [[ "$J_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fail "Invalid image name '$J_NAME' (letters, digits, . _ - only)."
+    is_int "$J_KEEP" 0 999 || fail "Invalid number of images to keep '$J_KEEP'."
+    is_int "$J_EXTRA" 0 1048576 || fail "Invalid extra space '$J_EXTRA'."
+    is_int "$J_FRESH" 0 1 || J_FRESH=0
+    is_int "$J_SCREEN" 0 1 || J_SCREEN=0
+    is_int "$J_VT" 1 63 || J_VT=8
+    is_int "$J_PORT" 1 65535 || J_PORT=5000
+    J_KEEP=$((10#$J_KEEP)); J_EXTRA=$((10#$J_EXTRA)); J_VT=$((10#$J_VT)); J_PORT=$((10#$J_PORT))
+
+    validate_destination
+
+    SERVICES=()
+    for s in ${J_SERVICES//,/ }; do
+        u="$s"
+        [[ "$u" == *.service ]] || u="$u.service"
+        [[ "$u" =~ ^[A-Za-z0-9@._:-]+\.service$ ]] || fail "Invalid service name '$s'."
+        [[ "$u" =~ $PROTECTED_RE ]] && fail "Refusing to stop $u (needed for networking, SSH or the system)."
+        [[ "$u" == "$OCTOPRINT_SERVICE" ]] && continue
+        [[ " ${SERVICES[*]} " == *" $u "* ]] && continue
+        SERVICES+=("$u")
+    done
+}
+
+validate_destination() {
+    local smb_re='^//[A-Za-z0-9._-]+(/[A-Za-z0-9 ._$@+-]+)+$'
+    local nfs_re='^[A-Za-z0-9._-]+:/[A-Za-z0-9._@+/-]*$'
+    local sub_re='^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$'
+    local opt_re='^[A-Za-z0-9=._:-]+(,[A-Za-z0-9=._:-]+)*$'
+    local o
+
+    case "$J_TYPE" in
+        local)
+            # image-backup only accepts paths under /mnt or /media (and leaves those out of the
+            # backup). No spaces or commas: image-backup splits its arguments on them.
+            while [[ "$J_DEST" == */ && "$J_DEST" != / ]]; do J_DEST="${J_DEST%/}"; done
+            [[ "$J_DEST" =~ ^/(mnt|media)(/[A-Za-z0-9._+@-]+)+$ ]] \
+                || fail "Destination '$J_DEST' must be a folder under /mnt or /media (letters, digits, . _ - + @ only, no spaces)."
+            [[ "/$J_DEST/" == */../* || "/$J_DEST/" == */./* ]] && fail "Destination '$J_DEST' must not contain . or .. parts."
+            [[ "$J_DEST" == "$NET_MNT" || "$J_DEST" == "$NET_MNT"/* ]] \
+                && fail "$NET_MNT is reserved for network shares - choose another folder."
+            DISPLAY_DEST="$J_DEST"
+            return 0
+            ;;
+        smb)
+            while [[ "$J_SHARE" == */ ]]; do J_SHARE="${J_SHARE%/}"; done
+            [[ "$J_SHARE" =~ $smb_re ]] || fail "Invalid SMB share '$J_SHARE' - expected //server/share."
+            [[ "$J_AUTH" == guest || "$J_AUTH" == credentials ]] || J_AUTH=guest
+            ;;
+        nfs)
+            while [[ "$J_SHARE" == */ && "$J_SHARE" != *:/ ]]; do J_SHARE="${J_SHARE%/}"; done
+            [[ "$J_SHARE" =~ $nfs_re ]] || fail "Invalid NFS export '$J_SHARE' - expected server:/path."
+            ;;
+        *)  fail "Invalid destination type '$J_TYPE'." ;;
+    esac
+    [[ "/${J_SHARE#*/}/" == */../* || "/${J_SHARE#*/}/" == */./* ]] && fail "The share path must not contain . or .. parts."
+
+    J_SUBDIR="${J_SUBDIR#/}"
+    while [[ "$J_SUBDIR" == */ ]]; do J_SUBDIR="${J_SUBDIR%/}"; done
+    if [[ -n "$J_SUBDIR" ]]; then
+        [[ "$J_SUBDIR" =~ $sub_re ]] || fail "Invalid folder on the share '$J_SUBDIR' (letters, digits, . _ - + @ and /, no spaces)."
+        [[ "/$J_SUBDIR/" == */../* || "/$J_SUBDIR/" == */./* ]] && fail "The folder on the share must not contain . or .. parts."
+    fi
+
+    if [[ -n "$J_OPTIONS" ]]; then
+        [[ "$J_OPTIONS" =~ $opt_re ]] || fail "Invalid mount options '$J_OPTIONS' (comma separated, no spaces)."
+        for o in ${J_OPTIONS//,/ }; do
+            case "${o%%=*}" in
+                credentials|cred|user|username|pass|password|password2|guest)
+                    fail "Mount option '${o%%=*}' is set by the plugin - remove it from the options." ;;
+            esac
+        done
+    fi
+
+    DISPLAY_DEST="$J_SHARE${J_SUBDIR:+/$J_SUBDIR}"
+}
+
+# ---------------------------------------------------------- network share ---
+
+share_error() {   # rc, mount output -> readable message
+    local rc=$1 out=$2 hint first
+    first="$(printf '%s' "$out" | grep -v -e '^[[:space:]]*$' -e '^Refer to' | head -n 1)"
+    if (( rc == 124 )); then
+        hint="The server did not answer within ${MOUNT_TIMEOUT} s. Check the address and that the server is on."
+    else
+        case "$out" in
+            *"error(13)"*|*"ermission denied"*|*"access denied"*)
+                if [[ "$J_TYPE" == smb && "$J_AUTH" == guest ]]; then
+                    hint="The share does not allow guest access - enter a username and password."
+                elif [[ "$J_TYPE" == smb ]]; then
+                    hint="Access denied - check the username and password, and that the user may use this share."
+                else
+                    hint="Access denied by the NFS server - check that the Pi's address is allowed in the export."
+                fi ;;
+            *"error(2)"*|*"No such file"*|*"does not exist"*)
+                hint="Share not found - check the share name or export path." ;;
+            *"error(112)"*|*"error(113)"*|*"error(111)"*|*"error(110)"*|*"Host is down"*|*"No route to host"*|*"Connection refused"*|*"timed out"*)
+                hint="Server not reachable - check the address and that the server is on." ;;
+            *"error(95)"*|*"Operation not supported"*|*"rotocol not supported"*)
+                hint="The server does not support this protocol version - try e.g. vers=3.0 or vers=2.0 in the mount options." ;;
+            *"resolve"*|*"Name or service not known"*|*"Unable to find suitable address"*|*"bad UNC"*)
+                hint="Cannot find the server - check the name or use its IP address." ;;
+            *"wrong fs type"*|*"unknown filesystem"*|*"helper program"*)
+                hint="SMB/NFS support is missing - click Update helper in the plugin." ;;
+            *)  hint="Mounting failed." ;;
+        esac
+    fi
+    echo "$hint (${first:-mount exit code $rc})"
+}
+
+mount_share() {
+    local opts out rc
+    [[ "$J_TYPE" == local ]] && return 0
+    mkdir -p "$NET_MNT"
+    if mountpoint -q "$NET_MNT"; then
+        log "Unmounting a leftover share mount at $NET_MNT"
+        umount "$NET_MNT" 2>/dev/null || umount -l "$NET_MNT" 2>/dev/null
+    fi
+    case "$J_TYPE" in
+        smb)
+            command -v mount.cifs >/dev/null 2>&1 \
+                || fail "SMB support (cifs-utils) is not installed - click Update helper in the plugin."
+            opts="uid=0,gid=0,file_mode=0644,dir_mode=0755"
+            if [[ "$J_AUTH" == credentials ]]; then
+                [[ -f "$CRED_FILE" ]] || fail "No SMB password is saved - enter it in the plugin settings."
+                opts+=",credentials=$CRED_FILE"
+            else
+                opts+=",guest"
+            fi
+            [[ -n "$J_OPTIONS" ]] && opts+=",$J_OPTIONS"
+            opts+=",nosuid,nodev,noexec"
+            log "Mounting SMB share $J_SHARE"
+            out="$(timeout "$MOUNT_TIMEOUT" mount -t cifs "$J_SHARE" "$NET_MNT" -o "$opts" 2>&1 < /dev/null)"
+            rc=$?
+            ;;
+        nfs)
+            command -v mount.nfs >/dev/null 2>&1 \
+                || fail "NFS support (nfs-common) is not installed - click Update helper in the plugin."
+            # soft: if the server goes away, the backup fails instead of keeping OctoPrint
+            # offline forever. Put "hard" in the mount options to change that.
+            opts="soft,timeo=150,retrans=3"
+            [[ -n "$J_OPTIONS" ]] && opts+=",$J_OPTIONS"
+            opts+=",nosuid,nodev,noexec"
+            log "Mounting NFS export $J_SHARE"
+            out="$(timeout "$MOUNT_TIMEOUT" mount -t nfs "$J_SHARE" "$NET_MNT" -o "$opts" 2>&1 < /dev/null)"
+            rc=$?
+            ;;
+    esac
+    if (( rc != 0 )); then
+        mountpoint -q "$NET_MNT" && umount -l "$NET_MNT" 2>/dev/null
+        rmdir "$NET_MNT" 2>/dev/null
+        fail "Could not connect to $J_SHARE: $(share_error "$rc" "$out")"
+    fi
+    SHARE_MOUNTED=1
+    echo "$NET_MNT" > "$NET_MOUNT_FILE"
+}
+
+unmount_share() {
+    [[ "$SHARE_MOUNTED" == 1 || -f "$NET_MOUNT_FILE" ]] || return 0
+    if mountpoint -q "$NET_MNT" 2>/dev/null; then
+        sync
+        if ! timeout 60 umount "$NET_MNT" 2>/dev/null; then
+            log "Share busy or not answering - detaching it lazily"
+            umount -l "$NET_MNT" 2>/dev/null
+        fi
+        log "Disconnected the share"
+    fi
+    rmdir "$NET_MNT" 2>/dev/null || true
+    rm -f "$NET_MOUNT_FILE"
+    SHARE_MOUNTED=0
+}
+
+# ------------------------------------------------------------ preflight ---
+
+find_image_backup() {
+    local p
+    if [[ -n "${IB_IMAGE_BACKUP:-}" ]]; then echo "$IB_IMAGE_BACKUP"; return 0; fi
+    for p in /usr/local/sbin/image-backup /usr/local/bin/image-backup /usr/sbin/image-backup /usr/bin/image-backup; do
+        [[ -x "$p" ]] && { echo "$p"; return 0; }
+    done
+    command -v image-backup 2>/dev/null
+}
+
+prepare_destination() {   # mounts a share if needed, sets REAL_DEST, checks it is writable
+    local t dir root_dev
+
+    if [[ "$J_TYPE" == local ]]; then
+        dir="$J_DEST"
+        [[ -d "$dir" ]] || fail "Destination $J_DEST does not exist - is the USB drive mounted?"
+    else
+        mount_share
+        dir="$NET_MNT"
+        if [[ -n "$J_SUBDIR" ]]; then
+            dir="$NET_MNT/$J_SUBDIR"
+            mkdir -p "$dir" 2>/dev/null \
+                || fail "Cannot create the folder $J_SUBDIR on the share - check that root may write there."
+        fi
+    fi
+    REAL_DEST="$(realpath -e "$dir" 2>/dev/null)" || fail "Cannot resolve destination $dir."
+    [[ "$REAL_DEST" =~ ^/(mnt|media)/[^[:space:],]+$ ]] \
+        || fail "Destination $dir points to $REAL_DEST, which is outside /mnt and /media."
+    root_dev="$(stat -c %d /)"
+    if [[ "$(stat -c %d "$REAL_DEST")" == "$root_dev" ]]; then
+        [[ "$J_TYPE" == local ]] \
+            && fail "Destination $REAL_DEST is on the SD card itself. Mount a USB drive or network share there first."
+        fail "The share does not seem to be mounted at $NET_MNT."
+    fi
+    t="$REAL_DEST/.octopi-image-backup-write-test.$$"
+    if ! ( : > "$t" ) 2>/dev/null; then
+        case "$J_TYPE" in
+            nfs) fail "Cannot write to the NFS export as root. Allow root on the server (no_root_squash) or map it to a user with write access." ;;
+            smb) fail "Cannot write to the SMB share - check that the user has write permission." ;;
+            *)   fail "Cannot write to $REAL_DEST (read-only?)." ;;
+        esac
+    fi
+    rm -f "$t"
+}
+
+plan_image() {   # sets FINAL / WORK / CREATE and the free-space numbers
+    # No leading dot: Samba marks dot files as hidden for Windows and keeps that flag
+    # when the file is renamed to its final name.
+    WORK="$REAL_DEST/$J_NAME.img.part"
+    if [[ "$J_MODE" == new ]]; then
+        FINAL="$REAL_DEST/$J_NAME-$(date +%Y%m%d-%H%M%S).img"
+        CREATE=1
+    else
+        FINAL="$REAL_DEST/$J_NAME.img"
+        if [[ ! -f "$FINAL" || "$J_FRESH" == 1 ]]; then CREATE=1; else CREATE=0; fi
+    fi
+    DISPLAY_FINAL="$DISPLAY_DEST/${FINAL##*/}"
+
+    SRC_USED_KB="$(df -Pk / | awk 'NR == 2 { print $3 }')"
+    AVAIL_KB="$(df -Pk "$REAL_DEST" | awk 'NR == 2 { print $4 }')"
+    [[ "$AVAIL_KB" =~ ^[0-9]+$ ]] || AVAIL_KB=""
+    NEED_KB=0
+    if (( CREATE )); then
+        NEED_KB=$(( SRC_USED_KB + SRC_USED_KB / 5 + 768 * 1024 ))
+        # a leftover partial image of an interrupted run is ours and gets replaced
+        if [[ -f "$WORK" && -n "$AVAIL_KB" ]]; then
+            AVAIL_KB=$(( AVAIL_KB + $(du -k "$WORK" 2>/dev/null | cut -f1) ))
+        fi
+    fi
+}
+
+space_problem() {   # prints a message if the image will not fit
+    if (( CREATE )) && [[ -n "$AVAIL_KB" ]] && (( AVAIL_KB < NEED_KB )); then
+        echo "Not enough free space on $DISPLAY_DEST: about $(fmt_gb "$NEED_KB") needed, $(fmt_gb "$AVAIL_KB") free."
+    fi
+}
+
+write_dest_info() {   # what the plugin shows about the destination (it cannot see shares)
+    local tmp="$DEST_INFO_FILE.tmp.$$" img imgs=()
+    DI_EXISTS=0 DI_SIZE="" DI_MTIME="" DI_COUNT=0
+    if [[ "$J_MODE" == update ]]; then
+        img="$REAL_DEST/$J_NAME.img"
+        [[ -f "$img" ]] && DI_COUNT=1
+    else
+        shopt -s nullglob
+        imgs=( "$REAL_DEST/$J_NAME"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].img )
+        shopt -u nullglob
+        DI_COUNT=${#imgs[@]}
+        (( DI_COUNT > 0 )) && img="${imgs[DI_COUNT-1]}"
+    fi
+    if (( DI_COUNT > 0 )); then
+        DI_EXISTS=1
+        DI_SIZE="$(stat -c %s "$img" 2>/dev/null)"
+        DI_MTIME="$(stat -c %Y "$img" 2>/dev/null)"
+    fi
+    DI_FREE="$(df -PB1 "$REAL_DEST" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+    {
+        printf 'checked_at=%s\n' "$(date +%s)"
+        printf 'dest_type=%s\nlocation=%s\nname=%s\nmode=%s\n' "$J_TYPE" "$DISPLAY_DEST" "$J_NAME" "$J_MODE"
+        printf 'free=%s\nimage_exists=%s\nimage_size=%s\nimage_mtime=%s\nimages=%s\n' \
+            "$DI_FREE" "$DI_EXISTS" "$DI_SIZE" "$DI_MTIME" "$DI_COUNT"
+    } > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$DEST_INFO_FILE"
+}
+
+preflight() {
+    local t problem
+
+    IMAGE_BACKUP="$(find_image_backup)"
+    [[ -n "$IMAGE_BACKUP" ]] || fail "image-backup (image-utils) is not installed - run install.sh with --with-image-utils."
+    for t in rsync gdisk sgdisk losetup mountpoint; do
+        command -v "$t" >/dev/null 2>&1 || fail "Required tool '$t' is missing - run install.sh again."
+    done
+    if pidof -x image-backup >/dev/null 2>&1; then
+        fail "image-backup is already running."
+    fi
+    prepare_destination
+    plan_image
+    write_dest_info
+    problem="$(space_problem)"
+    [[ -n "$problem" ]] && fail "$problem"
+    if (( CREATE )); then
+        # leftovers of an earlier interrupted run (current and pre-3 helper names)
+        rm -f "$WORK" "$REAL_DEST/.$J_NAME.partial.img"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------- services ---
+
+stop_services() {
+    local u stopped=()
+    : > "$STOPPED_FILE"
+    for u in "$OCTOPRINT_SERVICE" "${SERVICES[@]}"; do
+        if systemctl is-active --quiet "$u"; then
+            echo "$u" >> "$STOPPED_FILE"   # record first, so "recover" restarts it no matter what
+            log "Stopping $u"
+            if systemctl stop "$u"; then
+                stopped+=("${u%.service}")
+                [[ "$u" == "$OCTOPRINT_SERVICE" ]] && OP_STOPPED=1
+            else
+                log "WARNING: could not stop $u"
+            fi
+        elif [[ "$u" != "$OCTOPRINT_SERVICE" ]]; then
+            log "$u is not running, leaving it alone"
+        fi
+    done
+    D_STOP="${stopped[*]}"
+}
+
+restart_services() {
+    local units=() i u
+    [[ -f "$STOPPED_FILE" ]] || return 0
+    mapfile -t units < "$STOPPED_FILE"
+    for (( i = ${#units[@]} - 1; i >= 0; i-- )); do
+        u="${units[i]}"
+        [[ "$u" =~ ^[A-Za-z0-9@._:-]+\.service$ ]] || continue
+        log "Starting $u"
+        # The started service must not inherit our lock (or it would hold it forever)
+        if ! ( [[ -n "$LOCK_FD" ]] && exec {LOCK_FD}>&-; systemctl start --no-block "$u" ); then
+            log "WARNING: could not start $u"
+        fi
+    done
+    rm -f "$STOPPED_FILE"
+}
+
+octoprint_answers() {
+    local code
+    if command -v curl >/dev/null 2>&1; then
+        code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$J_PORT/api/version")"
+        [[ -n "$code" && "$code" != 000 ]]
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/$J_PORT") 2>/dev/null
+    fi
+}
+
+wait_for_octoprint() {
+    local deadline=$(( SECONDS + OCTOPRINT_WAIT ))
+    while (( SECONDS < deadline )); do
+        octoprint_answers && return 0
+        screen_draw
+        sleep 2
+    done
+    return 1
+}
+
+# ---------------------------------------------------------- image mounts ---
+
+cleanup_image_mounts() {   # after a hard kill of image-backup
+    local img=$1 loop
+    pidof -x image-backup >/dev/null 2>&1 && return 0
+    if mountpoint -q "$IMG_MNT" 2>/dev/null; then
+        log "Unmounting leftover image mount $IMG_MNT"
+        umount -R "$IMG_MNT" 2>/dev/null || umount -l -R "$IMG_MNT" 2>/dev/null
+    fi
+    if [[ -n "$img" ]]; then
+        for loop in $(losetup -j "$img" 2>/dev/null | cut -d: -f1); do
+            log "Detaching leftover loop device $loop"
+            losetup -d "$loop" 2>/dev/null
+        done
+    fi
+    rmdir "$IMG_MNT" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------- backup ---
+
+progress_text() {
+    local used pct
+    if mountpoint -q "$IMG_MNT" 2>/dev/null; then
+        COPY_SEEN=1
+        used="$(df -Pk "$IMG_MNT" 2>/dev/null | awk 'NR == 2 { print $3 }')"
+        if (( CREATE )) && [[ "$used" =~ ^[0-9]+$ ]] && (( SRC_USED_KB > 0 )); then
+            pct=$(( used * 100 / SRC_USED_KB ))
+            (( pct > 99 )) && pct=99
+            echo "Copying files: $(fmt_gb "$used") of ~$(fmt_gb "$SRC_USED_KB") ($pct %)"
+        else
+            echo "Copying changed files..."
+        fi
+    elif (( COPY_SEEN )); then
+        if (( CREATE )); then echo "Checking and shrinking the image..."; else echo "Finishing..."; fi
+    else
+        echo "Preparing the image..."
+    fi
+}
+
+run_image_backup() {
+    local args rc last_log=0
+    if (( CREATE )); then
+        local extra=$J_EXTRA
+        [[ "$J_MODE" == new ]] && extra=0
+        args=(--initial "$WORK,,$extra")
+        printf '%s\npartial\n' "$WORK" > "$WORK_STATE_FILE"
+        log "Creating a new image ($([[ "$J_MODE" == new ]] && echo "new image every time" || echo "extra space ${extra} MB"))"
+    else
+        args=("$FINAL")
+        printf '%s\nupdate\n' "$FINAL" > "$WORK_STATE_FILE"
+        log "Updating existing image $DISPLAY_FINAL"
+    fi
+    log "Running: $IMAGE_BACKUP ${args[*]}"
+
+    "$IMAGE_BACKUP" "${args[@]}" < /dev/null > >(tee -a "$LOG_FILE") 2>&1 &
+    BG_PID=$!
+    while kill -0 "$BG_PID" 2>/dev/null; do
+        D_COPY="$(progress_text)"
+        screen_draw
+        if (( SECONDS - last_log >= 30 )); then
+            log "progress: $D_COPY"
+            last_log=$SECONDS
+        fi
+        sleep 2 &
+        wait $!
+    done
+    wait "$BG_PID"
+    rc=$?
+    BG_PID=""
+    return $rc
+}
+
+apply_retention() {
+    local imgs=() i
+    RETENTION_REMOVED=0
+    (( J_KEEP > 0 )) || return 0
+    shopt -s nullglob
+    imgs=( "$REAL_DEST/$J_NAME"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].img )
+    shopt -u nullglob
+    (( ${#imgs[@]} > J_KEEP )) || return 0
+    for (( i = 0; i < ${#imgs[@]} - J_KEEP; i++ )); do
+        [[ "${imgs[i]}" == "$FINAL" ]] && continue
+        log "Removing old image ${imgs[i]##*/}"
+        rm -f -- "${imgs[i]}" && RETENTION_REMOVED=$((RETENTION_REMOVED + 1))
+    done
+}
+
+# ------------------------------------------------------- readme + log ---
+# Next to the images the plugin keeps two plain-text files (Windows line endings, so Notepad
+# shows them right):
+#   README.txt        restore instructions, rewritten after each successful backup
+#                     (<name>-README.txt instead if the folder has a README.txt of its own)
+#   <name>-log.txt    log of the last backup run, also written when it failed
+# A file the plugin did not write is never touched.
+
+README_FILE="README.txt"
+README_MARKER="Written by the OctoPrint System Image Backup plugin"
+
+dest_file_is_ours() {
+    local f=$1
+    [[ -e "$f" || -L "$f" ]] || return 0           # none yet
+    [[ -f "$f" && ! -L "$f" ]] || return 1
+    grep -qF "$README_MARKER" "$f" 2>/dev/null
+}
+
+put_dest_file() {   # target, content on stdin -> CRLF, written atomically; returns status
+    local f=$1 tmp
+    # No leading dot in the temp name (Samba would mark it hidden for Windows); mktemp
+    # creates it exclusively, and rename replaces a link instead of writing through it.
+    tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 1
+    if sed 's/\r*$/\r/' > "$tmp" && chmod 0644 "$tmp" && mv -f -- "$tmp" "$f"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+write_dest_log() {   # best effort: never fails anything
+    local f
+    [[ -n "$REAL_DEST" && -d "$REAL_DEST" && -f "$LOG_FILE" ]] || return 0
+    f="$REAL_DEST/$J_NAME-log.txt"
+    if ! dest_file_is_ours "$f"; then
+        log "${f##*/} in the backup folder was not written by this plugin - leaving it alone"
+        return 0
+    fi
+    if {
+        echo "OctoPi system image backup - log of the last backup run"
+        echo "($README_MARKER. Replaced by each backup.)"
+        echo
+        echo "Result:   ${ST[state]} - ${ST[message]}"
+        echo "Image:    ${DISPLAY_FINAL:-$DISPLAY_DEST}"
+        echo "Started:  $(date -d "@$START_TS" '+%Y-%m-%d %H:%M:%S')"
+        echo "Finished: $(date -d "@${ST[finished]:-$(date +%s)}" '+%Y-%m-%d %H:%M:%S')"
+        echo
+        cat "$LOG_FILE"
+    } | put_dest_file "$f"; then
+        log "Saved this log as ${f##*/} in the backup folder"
+    else
+        log "WARNING: could not save the log to the backup folder"
+    fi
+    return 0
+}
+
+write_readme() {   # best effort: never fails the backup
+    local f="$REAL_DEST/$README_FILE" alt="$REAL_DEST/$J_NAME-$README_FILE" target
+    local text u svc_list="OctoPrint" last took host size_kb
+    if dest_file_is_ours "$f"; then
+        target="$f"
+    elif dest_file_is_ours "$alt"; then
+        target="$alt"
+        log "$README_FILE in the backup folder is not from this plugin - using ${alt##*/} instead"
+    else
+        log "$README_FILE and ${alt##*/} in the backup folder are not from this plugin - leaving them alone"
+        return 0
+    fi
+
+    for u in "${SERVICES[@]}"; do
+        svc_list+=", ${u%.service}"
+    done
+    host="$(hostname 2>/dev/null)"
+    size_kb=$(( $(stat -c %s "$FINAL" 2>/dev/null || echo 0) / 1024 ))
+    took=$(( ($(date +%s) - START_TS + 30) / 60 ))
+    if (( took < 1 )); then took="under a minute"; else took="$took min"; fi
+    last="$(date '+%Y-%m-%d %H:%M'), ${FINAL##*/}, $(fmt_gb "$size_kb"), took $took"
+
+    IFS= read -r -d '' text <<'EOF'
+OctoPi system image backup
+==========================
+
+Each .img file in this folder is a full image of the Raspberry Pi "@HOST@":
+the operating system, OctoPrint with its plugins and settings, and everything
+else installed on the Pi, such as OctoDash, cameras and network settings.
+Written to a new SD card, it boots straight into that setup.
+
+Last successful backup: @LAST@
+
+
+HOW IT WAS MADE
+---------------
+
+The System Image Backup plugin in OctoPrint makes these images. It stops the
+services listed below, then runs image-backup from RonR's image-utils, which
+copies the running system into a raw .img file. The file only takes the space
+actually in use. Afterwards everything starts again.
+
+Stopped during the backup: @STOPPED@
+
+Files:
+  @NAME@.img
+      A single image, updated by each backup. The file date shows the last
+      backup.
+  @NAME@-YYYYMMDD-HHMMSS.img
+      One image per backup, if the plugin is set to keep several.
+  @NAME@.img.part
+      An image still being written. Don't restore it.
+  @NAME@-log.txt
+      Log of the last backup run, also when it failed.
+
+Use an image only if the last backup was successful: see the "Result" line in
+@NAME@-log.txt or the plugin tab in OctoPrint.
+
+
+RESTORING
+---------
+
+1. Write the .img file to an SD card with Raspberry Pi Imager. Under
+   "Choose OS", pick "Use custom". When Imager asks about OS customisation,
+   choose "No". The card must be at least as big as the image file; a bigger
+   card is fine.
+2. Put the card in the Pi and switch it on. On first boot, the system grows to
+   fill the card and the Pi reboots once by itself.
+3. Everything then works as before, with the same hostname, settings and
+   logins.
+
+To check the expansion, run:  df -h /
+The "Size" shown should be close to the card's capacity (about 29G for a 32 GB
+card). If it's much smaller, the system didn't expand. Expand it by hand with
+"sudo raspi-config" -> Advanced Options -> Expand Filesystem, then reboot.
+
+Don't run the restored card and the original at the same time, because they
+share the same hostname and keys.
+
+KEEP THE IMAGES PRIVATE: they contain the Wi-Fi password, SSH keys and
+OctoPrint logins.
+
+
+(@MARKER@ after each successful backup.
+Edits to this file are overwritten.)
+EOF
+    shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2: "&" in a replacement is literal
+    text="${text//@MARKER@/$README_MARKER}"
+    text="${text//@HOST@/$host}"
+    text="${text//@NAME@/$J_NAME}"
+    text="${text//@LAST@/$last}"
+    text="${text//@STOPPED@/$svc_list}"                # last: service names may contain "@"
+    if printf '%s' "$text" | put_dest_file "$target"; then
+        log "Wrote ${target##*/} with restore instructions"
+        # README.txt is free again: drop the stand-in written while it was taken
+        if [[ "$target" == "$f" && -f "$alt" && ! -L "$alt" ]] && grep -qF "$README_MARKER" "$alt" 2>/dev/null; then
+            rm -f -- "$alt" && log "Removed ${alt##*/} (replaced by $README_FILE)"
+        fi
+    else
+        log "WARNING: could not write ${target##*/} to the backup folder"
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------- exit ---
+
+on_term() {
+    FAIL_MSG="${FAIL_MSG:-Backup was cancelled (the service was stopped).}"
+    exit 143
+}
+
+on_exit() {
+    local rc=$? pause
+    trap '' TERM INT HUP
+    trap - EXIT
+
+    if [[ -n "$BG_PID" ]] && kill -0 "$BG_PID" 2>/dev/null; then
+        kill -TERM "$BG_PID" 2>/dev/null
+        wait "$BG_PID" 2>/dev/null
+    fi
+
+    if [[ "${ST[state]}" == running ]]; then
+        ST[state]=failed
+        ST[message]="${FAIL_MSG:-Backup failed (exit code $rc).}"
+        [[ "$S_CHECK" == active ]] && S_CHECK=fail
+        [[ "$S_STOP" == active ]] && S_STOP=fail
+        [[ "$S_COPY" == active ]] && S_COPY=fail
+    fi
+    [[ "$S_COPY" == fail ]] && D_COPY=""
+    if [[ "${ST[state]}" != success && -n "$FINAL" ]]; then
+        if (( CREATE )); then
+            cleanup_image_mounts "$WORK"
+            [[ -e "$WORK" ]] && { log "Removing incomplete image ${WORK##*/}"; rm -f -- "$WORK"; }
+        else
+            cleanup_image_mounts "$FINAL"
+            ST[message]+=" The existing image may be incomplete - consider recreating it from scratch."
+        fi
+    fi
+    rm -f "$WORK_STATE_FILE"
+    ST[finished]="$(date +%s)"
+    ST[duration]=$(( ST[finished] - START_TS ))
+    st_write                                   # final status before OctoPrint comes back
+
+    if [[ -f "$STOPPED_FILE" ]]; then
+        S_RESTART=active; D_RESTART=""; screen_draw
+        restart_services
+        if (( OP_STOPPED )); then
+            D_RESTART="Waiting for OctoPrint to answer..."
+            screen_draw
+            if wait_for_octoprint; then
+                S_RESTART=ok; D_RESTART=""
+                log "OctoPrint is up again"
+            else
+                S_RESTART=warn
+                D_RESTART="OctoPrint did not answer within $((OCTOPRINT_WAIT / 60)) minutes."
+                log "WARNING: OctoPrint did not answer within ${OCTOPRINT_WAIT}s"
+            fi
+        else
+            S_RESTART=ok
+        fi
+    else
+        S_RESTART=skip
+    fi
+    log "Done: ${ST[state]} - ${ST[message]}"
+    write_dest_log
+    unmount_share
+
+    if [[ "${ST[state]}" == success ]]; then
+        FOOTER=$'\033[1;32mBackup finished.\033[0m Returning to the previous screen...'
+        pause=$PAUSE_OK
+    else
+        FOOTER=$'\033[1;31mBackup FAILED:\033[0m '"${ST[message]}"
+        pause=$PAUSE_FAIL
+    fi
+    if (( SCREEN_ON )); then
+        screen_draw
+        sleep "$pause"
+        screen_close
+    fi
+    exit "$rc"
+}
+
+# ------------------------------------------------------------- commands ---
+
+cmd_run() {
+    local rc size
+    mkdir -p "$STATE_DIR" && chmod 0755 "$STATE_DIR"
+    : > "$LOG_FILE"; chmod 0644 "$LOG_FILE"
+    START_TS="$(date +%s)"
+    ST=([state]=running [started]="$START_TS" [finished]="" [duration]="" [mode]="" [created]=""
+        [image]="" [image_size]="" [message]="Backup running" [helper_version]="$HELPER_VERSION")
+    st_write
+    trap on_exit EXIT
+    trap on_term TERM INT HUP
+
+    log "octopi-image-backup $HELPER_VERSION starting (job file $JOB_FILE)"
+    exec {LOCK_FD}>"$LOCK_FILE"
+    flock -n "$LOCK_FD" || fail "A connection test or another backup is running - try again in a minute."
+    read_job
+    validate_job
+    ST[mode]="$J_MODE"
+    S_CHECK=active
+    preflight
+    S_CHECK=ok
+    ST[image]="$DISPLAY_FINAL"
+    ST[created]="$CREATE"
+    st_write
+    log "Checks passed. Image: $DISPLAY_FINAL ($( (( CREATE )) && echo new || echo update ))"
+
+    screen_open
+    S_STOP=active; screen_draw
+    stop_services
+    S_STOP=ok; S_COPY=active; screen_draw
+
+    run_image_backup
+    rc=$?
+    if (( rc != 0 )); then
+        S_COPY=fail
+        fail "image-backup failed (exit code $rc) - see the log for details."
+    fi
+    if (( CREATE )); then
+        mv -f -- "$WORK" "$FINAL" || fail "Could not rename the new image to ${FINAL##*/}."
+    fi
+    sync
+    S_COPY=ok; D_COPY=""
+
+    ST[message]="$( (( CREATE )) && echo "Image created" || echo "Image updated" )"
+    if [[ "$J_MODE" == new ]]; then
+        apply_retention
+        (( RETENTION_REMOVED > 0 )) && ST[message]+=", $RETENTION_REMOVED old image(s) removed"
+    fi
+    size="$(stat -c %s "$FINAL" 2>/dev/null)"
+    ST[image_size]="$size"
+    ST[state]=success
+    write_readme
+    write_dest_info
+    log "Backup finished: $DISPLAY_FINAL ($size bytes)"
+    exit 0
+}
+
+cmd_recover() {
+    local work="" kind="" vt="" ret="" blank=0 line fd
+    mkdir -p "$STATE_DIR"
+
+    if [[ -f "$WORK_STATE_FILE" ]]; then
+        { IFS= read -r work; IFS= read -r kind; } < "$WORK_STATE_FILE"
+    fi
+    cleanup_image_mounts "$work"
+
+    if [[ -f "$STOPPED_FILE" ]]; then
+        log "recover: restarting services that are still stopped"
+        restart_services
+    fi
+
+    st_load
+    if [[ "${ST[state]}" == running ]]; then
+        log "recover: the backup job ended without finishing"
+        ST[state]=failed
+        ST[message]="Backup was interrupted (killed or timed out)."
+        ST[finished]="$(date +%s)"
+        [[ "${ST[started]}" =~ ^[0-9]+$ ]] && ST[duration]=$(( ST[finished] - ST[started] ))
+        st_write
+    fi
+    # A partial new image is renamed on success, so if it is still there it is incomplete
+    if [[ "$kind" == partial && -n "$work" && -e "$work" ]]; then
+        log "recover: removing incomplete image ${work##*/}"
+        rm -f -- "$work"
+    fi
+    rm -f "$WORK_STATE_FILE"
+
+    if [[ -f "$NET_MOUNT_FILE" ]] || mountpoint -q "$NET_MNT" 2>/dev/null; then
+        log "recover: disconnecting the network share"
+        SHARE_MOUNTED=1
+        unmount_share
+    fi
+
+    if [[ -f "$SCREEN_STATE_FILE" ]]; then
+        while IFS= read -r line; do
+            case "$line" in
+                SCREEN_VT=*) vt="${line#*=}" ;;
+                RETURN_VT=*) ret="${line#*=}" ;;
+                OLD_BLANK=*) blank="${line#*=}" ;;
+            esac
+        done < "$SCREEN_STATE_FILE"
+        [[ "$blank" =~ ^[0-9]+$ ]] || blank=0
+        fd=""
+        if [[ "$vt" =~ ^[0-9]+$ ]] && exec {fd}>"/dev/tty$vt"; then :; else fd=""; fi
+        log "recover: giving the screen back (console $ret)"
+        screen_restore "$fd" "$vt" "$ret" "$blank"
+        [[ -n "$fd" ]] && exec {fd}>&-
+        rm -f "$SCREEN_STATE_FILE"
+    fi
+    return 0
+}
+
+cmd_test() {   # mount + check the destination; result as KEY=VALUE on stdout
+    local problem
+    mkdir -p "$STATE_DIR" && chmod 0755 "$STATE_DIR"
+    exec {LOCK_FD}>"$LOCK_FILE"
+    flock -n "$LOCK_FD" || fail "A backup is running right now."
+    trap unmount_share EXIT
+    trap 'exit 143' TERM INT HUP
+    read_job
+    validate_job
+    prepare_destination
+    plan_image
+    write_dest_info
+    problem="$(space_problem)"
+    printf 'ok=1\n'
+    printf 'location=%s\nfree=%s\nimage_exists=%s\nimage_size=%s\nimage_mtime=%s\nimages=%s\ncreates=%s\nneeded=%s\n' \
+        "$DISPLAY_DEST" "$DI_FREE" "$DI_EXISTS" "$DI_SIZE" "$DI_MTIME" "$DI_COUNT" "$CREATE" "$(( NEED_KB * 1024 ))"
+    [[ -n "$problem" ]] && printf 'warning=%s\n' "$problem"
+    return 0
+}
+
+cmd_set_credentials() {   # stdin: user=..., password=... (or clear=1). Never logged.
+    local line user="" pass="" have_pass=0 clear=0 n=0 domain="" tmp
+    local user_re='^[A-Za-z0-9._@ -]{1,128}$'
+    while (( n < 10 )) && IFS= read -r line; do
+        n=$((n + 1))
+        case "$line" in
+            user=*)     user="${line#user=}" ;;
+            password=*) pass="${line#password=}"; have_pass=1 ;;
+            clear=1)    clear=1 ;;
+        esac
+    done
+    mkdir -p "$CRED_DIR" && chmod 0755 "$CRED_DIR"
+    if (( clear )); then
+        rm -f "$CRED_FILE"
+        echo "ok"
+        return 0
+    fi
+    if [[ "$user" == *\\* ]]; then   # DOMAIN\user
+        domain="${user%%\\*}"
+        user="${user#*\\}"
+        [[ "$domain" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || fail "Invalid domain '$domain'."
+    fi
+    [[ "$user" =~ $user_re ]] || fail "Invalid username (letters, digits, space and . _ @ - only, optionally DOMAIN\\user)."
+    (( have_pass )) || fail "No password given."
+    (( ${#pass} <= 256 )) || fail "Password too long."
+    tmp="$(umask 077; mktemp "$CRED_DIR/.smb-credentials.XXXXXX")" || fail "Cannot write to $CRED_DIR."
+    {
+        printf 'username=%s\n' "$user"
+        printf 'password=%s\n' "$pass"
+        [[ -n "$domain" ]] && printf 'domain=%s\n' "$domain"
+    } > "$tmp"
+    if ! { chmod 0600 "$tmp" && mv -f "$tmp" "$CRED_FILE"; }; then
+        rm -f "$tmp"
+        fail "Cannot save the credentials."
+    fi
+    echo "ok"
+}
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }; }
+
+load_defaults() {   # systemd passes these via EnvironmentFile; sudo calls need them read here
+    local line key val
+    [[ -f "$DEFAULTS_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* && "$line" != \#* ]] || continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        val="${val#\"}"
+        val="${val%\"}"
+        case "$key" in
+            JOB_FILE)          JOB_FILE="$val" ;;
+            OCTOPRINT_SERVICE) OCTOPRINT_SERVICE="$val" ;;
+        esac
+    done < "$DEFAULTS_FILE"
+}
+load_defaults
+
+CMD="${1:-}"
+case "$CMD" in
+    run)                need_root; cmd_run ;;
+    recover)            need_root; cmd_recover ;;
+    test-destination)   need_root; CMD="test"; cmd_test ;;
+    set-credentials)    need_root; CMD="cred"; cmd_set_credentials ;;
+    --version)          echo "$HELPER_VERSION" ;;
+    *)  echo "usage: $0 run|recover|test-destination|set-credentials|--version" >&2
+        echo "(run and recover are normally started by octopi-image-backup.service)" >&2
+        exit 2 ;;
+esac
