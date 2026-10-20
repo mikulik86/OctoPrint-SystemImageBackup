@@ -1,0 +1,107 @@
+.sib h4 {
+    margin-top: 18px;
+}
+.sib h4:first-child {
+    margin-top: 0;
+}
+.sib .sib-refresh {
+    font-size: 14px;
+    margin-left: 6px;
+    color: inherit;
+    opacity: 0.6;
+}
+.sib .sib-refresh:hover {
+    opacity: 1;
+}
+.sib .sib-small {
+    font-size: 12px;
+    color: #777;
+}
+.sib .sib-setup ul {
+    margin-bottom: 10px;
+}
+.sib .sib-cmd {
+    position: relative;
+    margin-bottom: 8px;
+}
+.sib .sib-cmd pre {
+    margin: 0 0 4px 0;
+    padding-right: 8px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 12px;
+}
+.sib .sib-cmd .btn {
+    margin-right: 4px;
+}
+.sib .sib-log {
+    max-height: 260px;
+    overflow: auto;
+    font-size: 11px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+.sib .sib-status {
+    margin-bottom: 6px;
+}
+.sib .sib-status th {
+    width: 90px;
+    font-weight: normal;
+    color: #777;
+}
+.sib .sib-status code {
+    word-break: break-all;
+}
+.sib .sib-start {
+    margin: 14px 0 6px 0;
+    padding: 14px;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.02);
+}
+.sib .sib-start .btn-large {
+    margin-bottom: 6px;
+}
+.sib .sib-fresh {
+    margin: 4px 0;
+}
+.sib .sib-start-hint {
+    margin-top: 4px;
+}
+.sib .sib-settings .control-label {
+    width: 130px;
+}
+.sib .sib-settings .controls {
+    margin-left: 150px;
+}
+.sib .sib-settings .help-block {
+    font-size: 12px;
+}
+.sib .sib-check {
+    margin-top: 4px;
+    font-size: 12px;
+}
+.sib .sib-suggest {
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.06);
+}
+.sib .sib-suggest:before {
+    content: "+ ";
+}
+.sib input.sib-inline {
+    margin: 0 4px;
+    padding: 2px 4px;
+}
+@media (max-width: 767px) {
+    .sib .sib-settings .control-label {
+        width: auto;
+        float: none;
+        text-align: left;
+    }
+    .sib .sib-settings .controls {
+        margin-left: 0;
+    }
+}
