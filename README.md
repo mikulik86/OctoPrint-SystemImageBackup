@@ -47,13 +47,6 @@ backup refuses to start while a print is running or paused.
 - Space: the first backup needs about 1.2 × the used space of your system, plus 0.8 GB.
 - Image files are usually bigger than 4 GB, so **don't use a FAT32 USB drive**. Use ext4 or exFAT.
 
-Example `/etc/fstab` line for a USB drive (create the folder first with `sudo mkdir -p /mnt/backup`;
-find the UUID with `lsblk -f`):
-
-```
-UUID=1234-ABCD  /mnt/backup  ext4  defaults,nofail  0 2
-```
-
 ## Installation
 
 1. In OctoPrint, open **Settings → Plugin Manager → Get More** and paste this into
@@ -114,7 +107,8 @@ After a plugin update that changes the helper, the tab asks you to install it ag
     free space and whether an image is already there. Errors like a wrong password, an
     unknown share or an unreachable server are shown in plain words.
   - *USB drive or mounted folder*: a path under `/mnt` or `/media`, e.g. `/mnt/backup`. The tab
-    shows whether it's mounted and how much space is free.
+    shows whether it's mounted and how much space is free. The drive has to be mounted
+    already; see [Setting up a USB drive](#setting-up-a-usb-drive).
 - **Backup type**:
   - *Keep one image and update it*: the first run creates `octopi-backup.img`. Later runs only
     copy what changed, which is fast. **Room for updates** is free space reserved inside the
@@ -129,6 +123,32 @@ After a plugin update that changes the helper, the tab asks you to install it ag
 
 **Start backup now** asks for confirmation, saves unsaved settings and starts the backup.
 OctoPrint goes offline a few seconds later. The page reconnects by itself and shows the result.
+
+### Setting up a USB drive
+
+The plugin connects SMB and NFS shares itself, but a USB drive has to be mounted already.
+OctoPi doesn't mount USB drives automatically, so add a line for it to `/etc/fstab`, the
+list of drives the Pi mounts at every boot:
+
+1. Plug in the drive and find its UUID and filesystem type with `lsblk -f`.
+2. Create the folder it will appear in: `sudo mkdir -p /mnt/backup`
+3. Open the list with `sudo nano /etc/fstab` and add a line at the end:
+
+   ```
+   UUID=1234-ABCD  /mnt/backup  ext4  defaults,nofail  0 2
+   ```
+
+   - `UUID=1234-ABCD`: the drive, by the UUID from step 1. It stays the same even if the
+     device name (`/dev/sda1`) changes.
+   - `/mnt/backup`: the folder from step 2.
+   - `ext4`: the filesystem. Use `exfat` for an exFAT drive.
+   - `defaults,nofail`: standard options; `nofail` lets the Pi boot normally without the drive.
+   - `0 2`: the first number is unused (always 0); the 2 checks the drive for errors at boot.
+     Use `0 0` for exFAT.
+4. Mount it with `sudo mount -a` (this also reports mistakes in the line) and check it with
+   `df -h /mnt/backup`.
+
+Then enter `/mnt/backup` as the folder in the plugin.
 
 ### Progress on the Pi's screen (DSI/HDMI)
 
