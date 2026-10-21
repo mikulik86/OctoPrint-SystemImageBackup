@@ -36,6 +36,7 @@ WORK_STATE_FILE="$STATE_DIR/work-image"
 DEST_INFO_FILE="$STATE_DIR/dest-info"
 NET_MOUNT_FILE="$STATE_DIR/net-mount"
 LOCK_FILE="$STATE_DIR/lock"
+COPY_DONE_FILE="$STATE_DIR/copy-done"
 CRED_DIR="${IB_CRED_DIR:-/etc/octopi-image-backup}"
 CRED_FILE="$CRED_DIR/smb-credentials"
 DEFAULTS_FILE="${IB_DEFAULTS_FILE:-/etc/default/octopi-image-backup}"
@@ -69,6 +70,7 @@ SRC_USED_KB=0
 AVAIL_KB=""
 NEED_KB=0
 COPY_SEEN=0
+COPY_DONE=0
 START_TS=0
 RETENTION_REMOVED=0
 SHARE_MOUNTED=0
@@ -661,6 +663,9 @@ cleanup_image_mounts() {   # after a hard kill of image-backup
 progress_text() {
     local used pct
     if mountpoint -q "$IMG_MNT" 2>/dev/null; then
+        # image-backup mounts the image once more at the very end to restore folder dates
+        [[ -f "$COPY_DONE_FILE" ]] && COPY_DONE=1
+        if (( COPY_DONE )); then echo "Finishing..."; return; fi
         COPY_SEEN=1
         used="$(df -Pk "$IMG_MNT" 2>/dev/null | awk 'NR == 2 { print $3 }')"
         if (( CREATE )) && [[ "$used" =~ ^[0-9]+$ ]] && (( SRC_USED_KB > 0 )); then
@@ -671,14 +676,40 @@ progress_text() {
             echo "Copying changed files..."
         fi
     elif (( COPY_SEEN )); then
+        COPY_DONE=1
         if (( CREATE )); then echo "Checking and shrinking the image..."; else echo "Finishing..."; fi
     else
         echo "Preparing the image..."
     fi
 }
 
+image_backup_output() {   # image-backup's output for the log: timestamped, without noise
+    local line prev="" n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        # the filesystem checks start once all files are copied
+        [[ "$line" == "e2fsck "[0-9]* ]] && : > "$COPY_DONE_FILE"
+        case "$line" in
+            # blank lines, e2fsck's per-pass lines, tool version banners and image-backup's
+            # hint about running it by hand; anything else (errors included) is kept
+            ""|"Pass "[0-9]": "*|"e2fsck "[0-9]*|"resize2fs "[0-9]*|"Starting full backup"*) continue ;;
+        esac
+        if [[ "$line" == "$prev" ]]; then
+            n=$((n + 1))
+            continue
+        fi
+        (( n > 1 )) && log "image-backup: $prev ($n times)"
+        (( n == 1 )) && log "image-backup: $prev"
+        prev="$line"
+        n=1
+    done
+    (( n > 1 )) && log "image-backup: $prev ($n times)"
+    (( n == 1 )) && log "image-backup: $prev"
+    return 0
+}
+
 run_image_backup() {
-    local args rc last_log=0
+    local args rc last_log=0 out_fd filter_pid
     if (( CREATE )); then
         local extra=$J_EXTRA
         [[ "$J_MODE" == new ]] && extra=0
@@ -692,7 +723,10 @@ run_image_backup() {
     fi
     log "Running: $IMAGE_BACKUP ${args[*]}"
 
-    "$IMAGE_BACKUP" "${args[@]}" < /dev/null > >(tee -a "$LOG_FILE") 2>&1 &
+    rm -f "$COPY_DONE_FILE"
+    exec {out_fd}> >(image_backup_output)
+    filter_pid=$!
+    "$IMAGE_BACKUP" "${args[@]}" < /dev/null 1>&"$out_fd" 2>&1 &
     BG_PID=$!
     while kill -0 "$BG_PID" 2>/dev/null; do
         D_COPY="$(progress_text)"
@@ -707,6 +741,9 @@ run_image_backup() {
     wait "$BG_PID"
     rc=$?
     BG_PID=""
+    exec {out_fd}>&-
+    wait "$filter_pid" 2>/dev/null   # let the last lines reach the log first
+    rm -f "$COPY_DONE_FILE"
     return $rc
 }
 
