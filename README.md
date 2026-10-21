@@ -226,6 +226,8 @@ Your image files are never touched.
 
 ## Changelog
 
+- **0.4.1** – The `README.txt` next to the images has no line breaks inside paragraphs, so
+  Notepad's word wrap lays it out to the window width.
 - **0.4.0** – First release on GitHub. Full system images to a USB drive or an SMB or NFS
   share, progress on the Pi's screen, start from OctoDash, `README.txt` and log file next
   to the images, update notifications through OctoPrint's Software Update.

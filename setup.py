@@ -10,7 +10,7 @@ with io.open(os.path.join(here, "README.md"), encoding="utf-8") as f:
 
 setup(
     name="OctoPrint-SystemImageBackup",
-    version="0.4.0",
+    version="0.4.1",
     description=(
         "Full, bootable image backups of the Raspberry Pi system (SD card / boot drive) "
         "with image-utils, started from OctoPrint or OctoDash."

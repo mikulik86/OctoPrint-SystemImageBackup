@@ -22,7 +22,7 @@
 # job file itself is writable by the OctoPrint user, so it is read as plain data and every
 # value is validated. Nothing from it is ever executed.
 
-HELPER_VERSION=6
+HELPER_VERSION=7
 
 set -o pipefail
 umask 022
@@ -727,7 +727,7 @@ apply_retention() {
 
 # ------------------------------------------------------- readme + log ---
 # Next to the images the plugin keeps two plain-text files (Windows line endings, so Notepad
-# shows them right):
+# shows them right; paragraphs are single lines, so Notepad's word wrap lays them out):
 #   README.txt        restore instructions, rewritten after each successful backup
 #                     (<name>-README.txt instead if the folder has a README.txt of its own)
 #   <name>-log.txt    log of the last backup run, also written when it failed
@@ -807,10 +807,7 @@ write_readme() {   # best effort: never fails the backup
 OctoPi system image backup
 ==========================
 
-Each .img file in this folder is a full image of the Raspberry Pi "@HOST@":
-the operating system, OctoPrint with its plugins and settings, and everything
-else installed on the Pi, such as OctoDash, cameras and network settings.
-Written to a new SD card, it boots straight into that setup.
+Each .img file in this folder is a full image of the Raspberry Pi "@HOST@": the operating system, OctoPrint with its plugins and settings, and everything else installed on the Pi, such as OctoDash, cameras and network settings. Written to a new SD card, it boots straight into that setup.
 
 Last successful backup: @LAST@
 
@@ -818,54 +815,34 @@ Last successful backup: @LAST@
 HOW IT WAS MADE
 ---------------
 
-The System Image Backup plugin in OctoPrint makes these images. It stops the
-services listed below, then runs image-backup from RonR's image-utils, which
-copies the running system into a raw .img file. The file only takes the space
-actually in use. Afterwards everything starts again.
+The System Image Backup plugin in OctoPrint makes these images. It stops the services listed below, then runs image-backup from RonR's image-utils, which copies the running system into a raw .img file. The file only takes the space actually in use. Afterwards everything starts again.
 
 Stopped during the backup: @STOPPED@
 
 Files:
-  @NAME@.img
-      A single image, updated by each backup. The file date shows the last
-      backup.
-  @NAME@-YYYYMMDD-HHMMSS.img
-      One image per backup, if the plugin is set to keep several.
-  @NAME@.img.part
-      An image still being written. Don't restore it.
-  @NAME@-log.txt
-      Log of the last backup run, also when it failed.
+- @NAME@.img: a single image, updated by each backup. The file date shows the last backup.
+- @NAME@-YYYYMMDD-HHMMSS.img: one image per backup, if the plugin is set to keep several.
+- @NAME@.img.part: an image still being written. Don't restore it.
+- @NAME@-log.txt: log of the last backup run, also when it failed.
 
-Use an image only if the last backup was successful: see the "Result" line in
-@NAME@-log.txt or the plugin tab in OctoPrint.
+Use an image only if the last backup was successful: see the "Result" line in @NAME@-log.txt or the plugin tab in OctoPrint.
 
 
 RESTORING
 ---------
 
-1. Write the .img file to an SD card with Raspberry Pi Imager. Under
-   "Choose OS", pick "Use custom". When Imager asks about OS customisation,
-   choose "No". The card must be at least as big as the image file; a bigger
-   card is fine.
-2. Put the card in the Pi and switch it on. On first boot, the system grows to
-   fill the card and the Pi reboots once by itself.
-3. Everything then works as before, with the same hostname, settings and
-   logins.
+1. Write the .img file to an SD card with Raspberry Pi Imager. Under "Choose OS", pick "Use custom". When Imager asks about OS customisation, choose "No". The card must be at least as big as the image file; a bigger card is fine.
+2. Put the card in the Pi and switch it on. On first boot, the system grows to fill the card and the Pi reboots once by itself.
+3. Everything then works as before, with the same hostname, settings and logins.
 
-To check the expansion, run:  df -h /
-The "Size" shown should be close to the card's capacity (about 29G for a 32 GB
-card). If it's much smaller, the system didn't expand. Expand it by hand with
-"sudo raspi-config" -> Advanced Options -> Expand Filesystem, then reboot.
+To check the expansion, run "df -h /". The "Size" shown should be close to the card's capacity (about 29G for a 32 GB card). If it's much smaller, the system didn't expand. Expand it by hand with "sudo raspi-config" -> Advanced Options -> Expand Filesystem, then reboot.
 
-Don't run the restored card and the original at the same time, because they
-share the same hostname and keys.
+Don't run the restored card and the original at the same time, because they share the same hostname and keys.
 
-KEEP THE IMAGES PRIVATE: they contain the Wi-Fi password, SSH keys and
-OctoPrint logins.
+KEEP THE IMAGES PRIVATE: they contain the Wi-Fi password, SSH keys and OctoPrint logins.
 
 
-(@MARKER@ after each successful backup.
-Edits to this file are overwritten.)
+(@MARKER@ after each successful backup. Edits to this file are overwritten.)
 EOF
     shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2: "&" in a replacement is literal
     text="${text//@MARKER@/$README_MARKER}"
