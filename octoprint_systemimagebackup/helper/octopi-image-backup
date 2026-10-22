@@ -22,7 +22,7 @@
 # job file itself is writable by the OctoPrint user, so it is read as plain data and every
 # value is validated. Nothing from it is ever executed.
 
-HELPER_VERSION=7
+HELPER_VERSION=8
 
 set -o pipefail
 umask 022
@@ -36,7 +36,8 @@ WORK_STATE_FILE="$STATE_DIR/work-image"
 DEST_INFO_FILE="$STATE_DIR/dest-info"
 NET_MOUNT_FILE="$STATE_DIR/net-mount"
 LOCK_FILE="$STATE_DIR/lock"
-COPY_DONE_FILE="$STATE_DIR/copy-done"
+STEP_FILE="$STATE_DIR/step"            # current step after copying, for the screen
+FS_INFO_FILE="$STATE_DIR/image-fs"     # used and total blocks of a new image's filesystem
 CRED_DIR="${IB_CRED_DIR:-/etc/octopi-image-backup}"
 CRED_FILE="$CRED_DIR/smb-credentials"
 DEFAULTS_FILE="${IB_DEFAULTS_FILE:-/etc/default/octopi-image-backup}"
@@ -71,6 +72,7 @@ AVAIL_KB=""
 NEED_KB=0
 COPY_SEEN=0
 COPY_DONE=0
+IMG_FS_USED="" IMG_FS_TOTAL=""
 START_TS=0
 RETENTION_REMOVED=0
 SHARE_MOUNTED=0
@@ -134,8 +136,8 @@ fail() {
     exit 1
 }
 
-fmt_gb() {   # KiB -> "1.23 GB"
-    awk -v k="$1" 'BEGIN { printf "%.2f GB", k / 1024 / 1024 }'
+fmt_gb() {   # KiB -> "1.23 GB" (1 GB = 10^9 bytes, like SD card labels and the plugin's tab)
+    awk -v k="$1" 'BEGIN { printf "%.2f GB", k * 1024 / 1e9 }'
 }
 
 fmt_elapsed() {
@@ -518,7 +520,11 @@ plan_image() {   # sets FINAL / WORK / CREATE and the free-space numbers
     [[ "$AVAIL_KB" =~ ^[0-9]+$ ]] || AVAIL_KB=""
     NEED_KB=0
     if (( CREATE )); then
-        NEED_KB=$(( SRC_USED_KB + SRC_USED_KB / 5 + 768 * 1024 ))
+        # image-backup makes the system partition 1.2 x the used space, plus the boot
+        # partition (512 MB) and the room for updates
+        local extra_kb=$(( J_EXTRA * 1024 ))
+        [[ "$J_MODE" == new ]] && extra_kb=0
+        NEED_KB=$(( SRC_USED_KB + SRC_USED_KB / 5 + 768 * 1024 + extra_kb ))
         # a leftover partial image of an interrupted run is ours and gets replaced
         if [[ -f "$WORK" && -n "$AVAIL_KB" ]]; then
             AVAIL_KB=$(( AVAIL_KB + $(du -k "$WORK" 2>/dev/null | cut -f1) ))
@@ -661,57 +667,154 @@ cleanup_image_mounts() {   # after a hard kill of image-backup
 # --------------------------------------------------------------- backup ---
 
 progress_text() {
-    local used pct
+    local used pct step=""
+    # the image-backup output filter names each step after the copy (checks, shrinking, ...)
+    if [[ -s "$STEP_FILE" ]]; then
+        COPY_DONE=1
+        step="$(< "$STEP_FILE")"
+    fi
     if mountpoint -q "$IMG_MNT" 2>/dev/null; then
         # image-backup mounts the image once more at the very end to restore folder dates
-        [[ -f "$COPY_DONE_FILE" ]] && COPY_DONE=1
         if (( COPY_DONE )); then echo "Finishing..."; return; fi
         COPY_SEEN=1
         used="$(df -Pk "$IMG_MNT" 2>/dev/null | awk 'NR == 2 { print $3 }')"
         if (( CREATE )) && [[ "$used" =~ ^[0-9]+$ ]] && (( SRC_USED_KB > 0 )); then
-            pct=$(( used * 100 / SRC_USED_KB ))
-            (( pct > 99 )) && pct=99
-            echo "Copying files: $(fmt_gb "$used") of ~$(fmt_gb "$SRC_USED_KB") ($pct %)"
+            if (( used < SRC_USED_KB )); then
+                pct=$(( used * 100 / SRC_USED_KB ))
+                echo "Copying files: $(fmt_gb "$used") of ~$(fmt_gb "$SRC_USED_KB") ($pct %)"
+            else
+                # the copy can come out a bit bigger than the SD card's used space
+                echo "Copying files: $(fmt_gb "$used") (estimated ~$(fmt_gb "$SRC_USED_KB"))"
+            fi
         else
             echo "Copying changed files..."
         fi
+    elif [[ -n "$step" ]]; then
+        echo "$step"
     elif (( COPY_SEEN )); then
         COPY_DONE=1
-        if (( CREATE )); then echo "Checking and shrinking the image..."; else echo "Finishing..."; fi
+        if (( CREATE )); then echo "Checking the image..."; else echo "Finishing..."; fi
     else
         echo "Preparing the image..."
     fi
 }
 
-image_backup_output() {   # image-backup's output for the log: timestamped, without noise
-    local line prev="" n=0
+# After copying a new image, image-backup runs these tools on it, and their output is all it
+# prints:
+#   e2fsck     check 1: after copying
+#   resize2fs  three times: shrink the filesystem to its smallest size (resize2fs -M)
+#   e2fsck     check 2: after shrinking
+#   (with room for updates:) the partition is enlarged, then
+#   e2fsck     check 3: after enlarging the partition
+#   resize2fs  grow the filesystem into it
+#   e2fsck     check 4: after adding the room
+# The filter below turns that into one plain line per step, written to the log right away.
+# Lines it doesn't recognise - errors among them - go to the log as they are.
+
+ibo_check_label() {
+    case $1 in
+        1) echo "after copying" ;;
+        2) echo "after shrinking" ;;
+        3) echo "after enlarging the partition" ;;
+        *) echo "after adding the room for updates" ;;
+    esac
+}
+
+ibo_step() {   # what the screen shows during the step
+    printf '%s\n' "$1" > "$STEP_FILE" 2>/dev/null
+}
+
+image_backup_output() {   # $1 = room for updates in MB; image-backup's output -> log
+    local extra=$1 line prev="" rep=0 fsck_n=0 resize_n=0 tool="" unusual=0
+    local shrink_size="" shrunk=0 used total
+    local re_sum='^[^ ]+: [0-9]+/[0-9]+ files \([0-9.]+% non-contiguous\), ([0-9]+)/([0-9]+) blocks$'
+    local re_same='^The filesystem is already ([0-9]+) \(4k\) blocks long\.'
+    local re_now='^The filesystem on [^ ]+ is now ([0-9]+) \(4k\) blocks long\.'
+
+    ibo_flush_repeats() {
+        if (( rep == 1 )); then
+            log "image-backup: (the same line once more)"
+        elif (( rep > 1 )); then
+            log "image-backup: (the same line $rep more times)"
+        fi
+        rep=0 prev=""
+    }
+    ibo_flush_shrink() {   # one line for the three shrink runs
+        [[ -n "$shrink_size" ]] || return 0
+        if (( shrunk )); then
+            log "Shrinking the image: system partition reduced to $(fmt_gb $(( shrink_size * 4 )))"
+        else
+            log "Shrinking the image: nothing to shrink, system partition stays $(fmt_gb $(( shrink_size * 4 )))"
+        fi
+        shrink_size="" shrunk=0
+    }
+
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
-        # the filesystem checks start once all files are copied
-        [[ "$line" == "e2fsck "[0-9]* ]] && : > "$COPY_DONE_FILE"
         case "$line" in
-            # blank lines, e2fsck's per-pass lines, tool version banners and image-backup's
-            # hint about running it by hand; anything else (errors included) is kept
-            ""|"Pass "[0-9]": "*|"e2fsck "[0-9]*|"resize2fs "[0-9]*|"Starting full backup"*) continue ;;
+            # blank lines, e2fsck's per-pass lines, image-backup's hint about running it by
+            # hand, and resize2fs's announcement (its result line follows)
+            ""|"Pass "[0-9]": "*|"Starting full backup"*|"Resizing the filesystem on "*)
+                continue ;;
+            "e2fsck "[0-9]*)   # version banner = a check starts
+                ibo_flush_repeats; ibo_flush_shrink
+                fsck_n=$((fsck_n + 1)) tool=e2fsck unusual=0
+                ibo_step "Checking the image $(ibo_check_label "$fsck_n")..."
+                continue ;;
+            "resize2fs "[0-9]*)
+                ibo_flush_repeats
+                resize_n=$((resize_n + 1)) tool=resize2fs
+                if (( resize_n <= 3 )); then
+                    ibo_step "Shrinking the image..."
+                else
+                    ibo_step "Adding the room for updates..."
+                fi
+                continue ;;
         esac
-        if [[ "$line" == "$prev" ]]; then
-            n=$((n + 1))
+
+        if [[ "$tool" == e2fsck && "$line" =~ $re_sum ]]; then
+            ibo_flush_repeats
+            used=${BASH_REMATCH[1]} total=${BASH_REMATCH[2]}
+            printf '%s %s\n' "$used" "$total" > "$FS_INFO_FILE" 2>/dev/null
+            if (( unusual )); then
+                log "Filesystem check $(ibo_check_label "$fsck_n"): see the messages above ($(fmt_gb $(( used * 4 ))) of $(fmt_gb $(( total * 4 ))) used)"
+            else
+                log "Filesystem check $(ibo_check_label "$fsck_n"): OK, $(fmt_gb $(( used * 4 ))) of $(fmt_gb $(( total * 4 ))) used"
+            fi
+            tool=""
             continue
         fi
-        (( n > 1 )) && log "image-backup: $prev ($n times)"
-        (( n == 1 )) && log "image-backup: $prev"
+        if [[ "$tool" == resize2fs ]] && [[ "$line" =~ $re_same || "$line" =~ $re_now ]]; then
+            ibo_flush_repeats
+            used=${BASH_REMATCH[1]}   # the filesystem's size in blocks
+            if (( resize_n <= 3 )); then
+                [[ "$line" == *" is now "* ]] && shrunk=1
+                shrink_size=$used
+            else
+                log "Adding ${extra} MB room for updates: system partition now $(fmt_gb $(( used * 4 )))"
+            fi
+            continue
+        fi
+
+        # anything else: as it is, with repeats counted instead of repeated
+        [[ "$tool" == e2fsck ]] && unusual=1
+        if [[ -n "$prev" && "$line" == "$prev" ]]; then
+            rep=$((rep + 1))
+            continue
+        fi
+        ibo_flush_repeats
+        log "image-backup: $line"
         prev="$line"
-        n=1
     done
-    (( n > 1 )) && log "image-backup: $prev ($n times)"
-    (( n == 1 )) && log "image-backup: $prev"
+    ibo_flush_repeats
+    ibo_flush_shrink
     return 0
 }
 
 run_image_backup() {
-    local args rc last_log=0 out_fd filter_pid
+    local args rc last_log=0 out_fd filter_pid extra=0 logged_finish=0
     if (( CREATE )); then
-        local extra=$J_EXTRA
+        extra=$J_EXTRA
         [[ "$J_MODE" == new ]] && extra=0
         args=(--initial "$WORK,,$extra")
         printf '%s\npartial\n' "$WORK" > "$WORK_STATE_FILE"
@@ -723,17 +826,23 @@ run_image_backup() {
     fi
     log "Running: $IMAGE_BACKUP ${args[*]}"
 
-    rm -f "$COPY_DONE_FILE"
-    exec {out_fd}> >(image_backup_output)
+    rm -f "$STEP_FILE" "$FS_INFO_FILE"
+    IMG_FS_USED="" IMG_FS_TOTAL=""
+    exec {out_fd}> >(image_backup_output "$extra")
     filter_pid=$!
     "$IMAGE_BACKUP" "${args[@]}" < /dev/null 1>&"$out_fd" 2>&1 &
     BG_PID=$!
     while kill -0 "$BG_PID" 2>/dev/null; do
         D_COPY="$(progress_text)"
         screen_draw
-        if (( SECONDS - last_log >= 30 )); then
+        # the log gets the copy progress every 30 s; the steps after it are logged by
+        # image_backup_output
+        if [[ "$D_COPY" == Copying* ]] && (( SECONDS - last_log >= 30 )); then
             log "progress: $D_COPY"
             last_log=$SECONDS
+        elif [[ "$D_COPY" == Finishing* ]] && (( ! logged_finish )); then
+            log "progress: $D_COPY"
+            logged_finish=1
         fi
         sleep 2 &
         wait $!
@@ -743,7 +852,10 @@ run_image_backup() {
     BG_PID=""
     exec {out_fd}>&-
     wait "$filter_pid" 2>/dev/null   # let the last lines reach the log first
-    rm -f "$COPY_DONE_FILE"
+    if [[ -s "$FS_INFO_FILE" ]]; then
+        read -r IMG_FS_USED IMG_FS_TOTAL < "$FS_INFO_FILE"
+    fi
+    rm -f "$STEP_FILE" "$FS_INFO_FILE"
     return $rc
 }
 
@@ -1031,7 +1143,12 @@ cmd_run() {
     ST[state]=success
     write_readme
     write_dest_info
-    log "Backup finished: $DISPLAY_FINAL ($size bytes)"
+    log "Backup finished: $DISPLAY_FINAL ($(fmt_gb $(( ${size:-0} / 1024 ))), ${size:-?} bytes)"
+    # where the size of a new image comes from (image-backup formats it with 4 KiB blocks)
+    if (( CREATE )) && [[ "$IMG_FS_USED" =~ ^[0-9]+$ && "$IMG_FS_TOTAL" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ ]] \
+            && (( size > IMG_FS_TOTAL * 4096 )); then
+        log "Image contents: system partition $(fmt_gb $(( IMG_FS_TOTAL * 4 ))) ($(fmt_gb $(( IMG_FS_USED * 4 ))) used, $(fmt_gb $(( (IMG_FS_TOTAL - IMG_FS_USED) * 4 ))) free), boot partition $(fmt_gb $(( size / 1024 - IMG_FS_TOTAL * 4 )))"
+    fi
     exit 0
 }
 

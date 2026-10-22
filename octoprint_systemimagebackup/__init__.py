@@ -33,7 +33,7 @@ STATUS_FILE = os.path.join(STATE_DIR, "status")
 LOG_FILE = os.path.join(STATE_DIR, "last.log")
 DEST_INFO_FILE = os.path.join(STATE_DIR, "dest-info")
 CRED_FILE = "/etc/octopi-image-backup/smb-credentials"
-EXPECTED_HELPER_VERSION = 7
+EXPECTED_HELPER_VERSION = 8
 
 SUDO = "/usr/bin/sudo"
 SYS_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -611,8 +611,11 @@ class SystemImageBackupPlugin(
             result["image"] = os.path.join(real, name + "-YYYYMMDD-HHMMSS.img")
 
         if result["creates"]:
+            # like image-backup: system partition 1.2 x the used space, the boot partition
+            # (512 MB) and the room for updates
             used = shutil.disk_usage("/").used
-            result["needed"] = int(used * 1.2) + 768 * 1024 * 1024
+            extra = 0 if mode == "new" else _to_int(s.get(["extra_mb"]), 1024, 0, 1048576)
+            result["needed"] = int(used * 1.2) + (768 + extra) * 1024 * 1024
             if result["free"] is not None and result["free"] < result["needed"]:
                 result["message"] = "Not enough free space: about {:.1f} GB needed, {:.1f} GB free.".format(
                     result["needed"] / 1e9, result["free"] / 1e9

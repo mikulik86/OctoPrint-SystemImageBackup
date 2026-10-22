@@ -8,8 +8,8 @@ with Raspberry Pi Imager or balenaEtcher and boots straight into your current se
 OctoPrint, plugins, OctoDash, network settings, everything.
 
 It uses **image-utils** by RonR (Raspberry Pi forums). `image-backup` copies the running
-system with `rsync` into an image file that is only as big as the used space, and can update
-that image incrementally later.
+system with `rsync` into an image file sized to the used space instead of the whole card
+(see [how big the image gets](#good-to-know)), and can update that image incrementally later.
 
 OctoPrint's built-in *Backup & Restore* only saves OctoPrint's own settings, plugins and
 uploads. This plugin saves the whole operating system.
@@ -44,7 +44,8 @@ backup refuses to start while a print is running or paused.
   - a **USB drive** (or a share you mount yourself) under `/mnt` or `/media`. It can't be a
     folder on the SD card itself. image-backup only accepts these paths and leaves them out
     of the backup.
-- Space: the first backup needs about 1.2 × the used space of your system, plus 0.8 GB.
+- Space: the first backup needs about 1.2 × the used space of your system, plus 0.8 GB, plus
+  the *Room for updates* you set.
 - Image files are usually bigger than 4 GB, so **don't use a FAT32 USB drive**. Use ext4 or exFAT.
 
 ## Installation
@@ -222,10 +223,25 @@ Your image files are never touched.
 - In update mode there is only one image. If a backup is interrupted halfway, that image may
   be incomplete. The tab says so; recreate it from scratch next time. Use *new image every
   time* with *keep 2* or more if you want a safety net.
+- A new image is bigger than the used space on the card. image-backup makes the system
+  partition 1.2 × the used space and then shrinks it, but the shrinking step often finds
+  nothing to remove. On top of that come the *Room for updates* and the 0.5 GB boot partition.
+  For example, 8.1 GB of used space gives an image of about 11.4 GB, with 2.2 GB free inside.
+  The last lines of the log show this breakdown for each new image. The free space isn't lost:
+  in update mode, it's what the system can grow into, and on restore the system expands to fill
+  the card anyway.
+- Sizes are given in GB of 10⁹ bytes, the way SD cards are labelled. Windows Explorer counts
+  in units of 2³⁰ bytes, so it shows a slightly smaller number, e.g. 10.5 GB for an
+  11.4 GB image.
 - The backup runs at most 6 hours before systemd stops it. OctoPrint is restarted in any case.
 
 ## Changelog
 
+- **0.4.2** – Clearer log: each step after copying (four filesystem checks, shrinking, adding
+  the room for updates) is one plain line, in the right order, and the log ends with what the
+  image is made of. The Pi's screen shows these steps too. Sizes are now in GB of 10⁹ bytes
+  everywhere, as in the tab; the log and `README.txt` used 2³⁰ before. The free-space check
+  before a new image now includes the room for updates. Click **Update helper** after updating.
 - **0.4.1** – The `README.txt` next to the images has no line breaks inside paragraphs, so
   Notepad's word wrap lays it out to the window width.
   The log file is easier to read: image-backup's repeated check output is condensed, and
