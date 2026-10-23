@@ -33,7 +33,7 @@ STATUS_FILE = os.path.join(STATE_DIR, "status")
 LOG_FILE = os.path.join(STATE_DIR, "last.log")
 DEST_INFO_FILE = os.path.join(STATE_DIR, "dest-info")
 CRED_FILE = "/etc/octopi-image-backup/smb-credentials"
-EXPECTED_HELPER_VERSION = 9
+EXPECTED_HELPER_VERSION = 10
 
 SUDO = "/usr/bin/sudo"
 SYS_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

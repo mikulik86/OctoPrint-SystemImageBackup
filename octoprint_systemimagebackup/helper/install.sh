@@ -26,6 +26,7 @@ UNIT_DST=/etc/systemd/system/$UNIT_NAME
 ENV_DST=/etc/default/octopi-image-backup
 SUDOERS_DST=/etc/sudoers.d/octopi-image-backup
 STATE_DIR=/var/lib/octopi-image-backup
+RUN_DIR=/run/octopi-image-backup        # progress view while a backup runs (RAM)
 CRED_DIR=/etc/octopi-image-backup
 NET_MNT=/mnt/octopi-image-backup
 
@@ -82,7 +83,7 @@ if (( UNINSTALL )); then
     rmdir "$NET_MNT" 2>/dev/null || true
     say "Removing helper, service, sudoers rule, saved SMB password and status folder"
     rm -f "$HELPER_DST" "$UNIT_DST" "$ENV_DST" "$SUDOERS_DST"
-    rm -rf "$STATE_DIR" "$CRED_DIR"
+    rm -rf "$STATE_DIR" "$CRED_DIR" "$RUN_DIR"
     systemctl daemon-reload
     say "Done. image-utils (/usr/local/sbin/image-*), rsync, gdisk, cifs-utils and nfs-common were left installed."
     exit 0

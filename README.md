@@ -78,6 +78,7 @@ The installer puts these in place:
 | sudoers rules: OctoPrint may *only* start that service, test the destination and save the SMB password | `/etc/sudoers.d/octopi-image-backup` |
 | Saved SMB password (readable by root only) | `/etc/octopi-image-backup/` |
 | Status and log of the last backup | `/var/lib/octopi-image-backup/` |
+| Progress view while a backup runs (in RAM, gone after a reboot) | `/run/octopi-image-backup/` |
 | `rsync`, `gdisk`, `cifs-utils`, `nfs-common` (from apt, if missing) | system packages |
 | image-utils (with `--with-image-utils`) | `/usr/local/sbin/image-*` |
 
@@ -154,7 +155,8 @@ Then enter `/mnt/backup` as the folder in the plugin.
 ### Progress on the Pi's screen (DSI/HDMI) or over SSH
 
 With *Show progress on the screen* on, the service switches the display to an unused text
-console (default 8) and shows each step, how much has been copied and the elapsed time. When
+console (default 8) and shows each step with a progress bar while copying, the elapsed time
+and the latest log lines, as many as fit on the screen. It updates every second. When
 OctoPrint answers again, it switches back to the previous screen, e.g. OctoDash, which keeps
 running in the background the whole time. After a failure, the error stays on screen for 30 s
 first.
@@ -168,7 +170,8 @@ under the Start button, with a Copy button:
 /usr/local/sbin/octopi-image-backup watch
 ```
 
-It shows the same view as the Pi's screen. If no backup is running yet, it waits for one, so
+It shows the same view as the Pi's screen; in a smaller window it leaves out older log lines
+instead of scrolling. If no backup is running yet, it waits for one, so
 you can start it before clicking **Start backup now**. It ends by itself with the result.
 Ctrl+C stops watching, not the backup. It doesn't need sudo. The full log of a running backup
 is also in the system journal: `journalctl -u octopi-image-backup -f`.
@@ -245,6 +248,10 @@ Your image files are never touched.
 
 ## Changelog
 
+- **0.4.6** – The progress view (Pi's screen and SSH) updates every second, shows a progress bar
+  while copying and the latest log lines, as many as fit on the screen. In a smaller SSH
+  window, older lines are left out instead of scrolling. The view's files are kept in RAM
+  (`/run`) instead of on the SD card. Click **Update helper** after updating.
 - **0.4.5** – The start confirmation also shows the command for watching the backup over SSH.
 - **0.4.4** – Watch a running backup over SSH with `/usr/local/sbin/octopi-image-backup watch`:
   the same view as on the Pi's screen, with or without the screen option. The tab shows this
