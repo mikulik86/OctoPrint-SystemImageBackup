@@ -69,6 +69,15 @@
 .sib .sib-start-hint {
     margin-top: 4px;
 }
+.sib .sib-follow {
+    margin-top: 12px;
+}
+.sib .sib-follow p {
+    margin: 0 0 4px 0;
+}
+.sib .sib-follow .sib-cmd {
+    margin-bottom: 0;
+}
 .sib .sib-settings .control-label {
     width: 130px;
 }

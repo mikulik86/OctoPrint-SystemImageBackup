@@ -159,7 +159,8 @@ OctoPrint answers again, it switches back to the previous screen, e.g. OctoDash,
 running in the background the whole time. After a failure, the error stays on screen for 30 s
 first.
 
-Without a screen, leave the option off. You can follow a running backup over SSH:
+Without a screen, leave the option off. You can follow a running backup over SSH with this
+command. The tab shows it under the Start button, with a Copy button:
 
 ```
 journalctl -u octopi-image-backup -f
@@ -237,6 +238,7 @@ Your image files are never touched.
 
 ## Changelog
 
+- **0.4.3** – The tab shows the SSH command for following a running backup, with a Copy button.
 - **0.4.2** – Clearer log: each step after copying (four filesystem checks, shrinking, adding
   the room for updates) is one plain line, in the right order, and the log ends with what the
   image is made of. The Pi's screen shows these steps too. Sizes are now in GB of 10⁹ bytes
