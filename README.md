@@ -245,6 +245,7 @@ Your image files are never touched.
 
 ## Changelog
 
+- **0.4.5** – The start confirmation also shows the command for watching the backup over SSH.
 - **0.4.4** – Watch a running backup over SSH with `/usr/local/sbin/octopi-image-backup watch`:
   the same view as on the Pi's screen, with or without the screen option. The tab shows this
   command instead of the journalctl one. Click **Update helper** after updating.

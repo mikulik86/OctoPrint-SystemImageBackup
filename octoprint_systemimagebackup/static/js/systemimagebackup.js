@@ -3,6 +3,7 @@
  */
 $(function () {
     var PLUGIN = "systemimagebackup";
+    var WATCH_COMMAND = "/usr/local/sbin/octopi-image-backup watch"; // as on the tab
 
     function SystemImageBackupViewModel(parameters) {
         var self = this;
@@ -434,10 +435,13 @@ $(function () {
 
         self.startBackup = function () {
             var fresh = self.mode() === "update" && self.imageExists() && self.fresh();
+            // OctoPrint puts the message into a <p> as HTML
             var question =
                 "OctoPrint (and the services you listed) will stop now and start again when the backup is finished. " +
                 "The web interface is unavailable in the meantime" +
-                (self.showOnScreen() ? "; the Pi's screen shows the progress." : ".");
+                (self.showOnScreen() ? "; the Pi's screen shows the progress." : ".") +
+                "</p><p>To watch the backup over SSH, run this on the Pi:<br>" +
+                "<code>" + WATCH_COMMAND + "</code>";
             showConfirmationDialog({
                 title: "Start system image backup?",
                 message: question,
