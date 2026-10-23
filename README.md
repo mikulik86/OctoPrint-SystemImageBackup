@@ -78,7 +78,7 @@ The installer puts these in place:
 | sudoers rules: OctoPrint may *only* start that service, test the destination and save the SMB password | `/etc/sudoers.d/octopi-image-backup` |
 | Saved SMB password (readable by root only) | `/etc/octopi-image-backup/` |
 | Status and log of the last backup | `/var/lib/octopi-image-backup/` |
-| Progress view while a backup runs (in RAM, gone after a reboot) | `/run/octopi-image-backup/` |
+| Progress view and a copy of image-backup with the loop wait, while a backup runs (in RAM, gone after a reboot) | `/run/octopi-image-backup/` |
 | `rsync`, `gdisk`, `cifs-utils`, `nfs-common` (from apt, if missing) | system packages |
 | image-utils (with `--with-image-utils`) | `/usr/local/sbin/image-*` |
 
@@ -244,10 +244,21 @@ Your image files are never touched.
 - Sizes are given in GB of 10⁹ bytes, the way SD cards are labelled. Windows Explorer counts
   in units of 2³⁰ bytes, so it shows a slightly smaller number, e.g. 10.5 GB for an
   11.4 GB image.
+- image-backup uses the image's partitions right after attaching it as a loop device, but
+  the partition devices appear a moment later. Now and then this made a backup fail at once
+  with "special device /dev/loop1p2 does not exist". The plugin therefore runs image-backup
+  from a copy in RAM that waits for the partitions; the installed file stays unchanged. The
+  copy is only made if image-backup's `mkloop` function is exactly the known code. If not
+  (e.g. a different image-utils version), image-backup runs unchanged and the tab shows a
+  warning. If the error appears, start the backup again.
 - The backup runs at most 6 hours before systemd stops it. OctoPrint is restarted in any case.
 
 ## Changelog
 
+- **0.4.7** – Fixes an occasional failure at the start of a new image ("special device
+  /dev/loop1p2 does not exist"): image-backup now waits until the image's partitions are ready.
+  The tab warns if the installed image-backup differs from the known version, in which case it
+  runs unchanged. Click **Update helper** after updating.
 - **0.4.6** – The progress view (Pi's screen and SSH) updates every second, shows a progress bar
   while copying and the latest log lines, as many as fit on the screen. In a smaller SSH
   window, older lines are left out instead of scrolling. The view's files are kept in RAM

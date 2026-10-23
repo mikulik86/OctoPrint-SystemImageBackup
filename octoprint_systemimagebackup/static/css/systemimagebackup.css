@@ -17,6 +17,12 @@
     font-size: 12px;
     color: #777;
 }
+.sib .sib-warning p {
+    margin: 0;
+}
+.sib .sib-warning p + p {
+    margin-top: 6px;
+}
 .sib .sib-setup ul {
     margin-bottom: 10px;
 }

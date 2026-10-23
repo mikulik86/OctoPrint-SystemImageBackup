@@ -120,6 +120,10 @@ $(function () {
             var h = self.helper();
             return h ? h.problems : [];
         });
+        self.helperWarnings = ko.pureComputed(function () {
+            var h = self.helper();
+            return h && h.warnings ? h.warnings : [];
+        });
         self.setupNeeded = ko.pureComputed(function () {
             return self.setupProblems().length > 0 || self.install.running();
         });

@@ -52,6 +52,10 @@
             Helper installed. <a href="#" data-bind="click: dismissInstall">Hide</a>
         </div>
 
+        <div class="alert sib-warning" data-bind="visible: !setupNeeded() && helperWarnings().length, foreach: helperWarnings" style="display: none">
+            <p><i class="fas fa-exclamation-triangle"></i> <span data-bind="text: $data"></span></p>
+        </div>
+
         <!-- ========================================================== status -->
         <h4>
             Last backup

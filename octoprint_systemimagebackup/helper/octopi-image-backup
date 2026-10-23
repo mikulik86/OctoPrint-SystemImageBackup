@@ -22,7 +22,7 @@
 # job file itself is writable by the OctoPrint user, so it is read as plain data and every
 # value is validated. Nothing from it is ever executed.
 
-HELPER_VERSION=10
+HELPER_VERSION=11
 
 set -o pipefail
 umask 022
@@ -582,6 +582,85 @@ find_image_backup() {
     command -v image-backup 2>/dev/null
 }
 
+# ------------------------------------------------ image-backup loop wait ---
+# image-backup attaches the image with "losetup -P" and uses its partitions (/dev/loopNp2) right
+# away, but the partition devices appear a moment later (and udev may re-read them once more).
+# Now and then a mount then fails with "special device /dev/loopNp2 does not exist". So the
+# backup runs a copy of image-backup in RAM whose mkloop() waits for the partitions. The copy is
+# only made when mkloop() is exactly the code below; otherwise image-backup runs unchanged and
+# the plugin's tab shows a warning ("check-image-backup").
+
+MKLOOP_KNOWN='mkloop()
+{
+  LOOP="$(losetup -f --show -P "${IMGFILE}")"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to create loop device"
+  fi
+}'
+MKLOOP_WAIT=(
+'  # added by octopi-image-backup: wait until the loop partitions exist (they appear a moment'
+'  # after losetup, and udev may re-read them once more)'
+'  if command -v udevadm > /dev/null 2>&1; then'
+'    udevadm settle --timeout=10; sleep 0.5; udevadm settle --timeout=10'
+'  fi'
+'  for IB_WAIT in $(seq 1 50); do'
+'    [ -b "${LOOP}p1" ] && [ -b "${LOOP}p2" ] && break'
+'    sleep 0.2'
+'  done'
+)
+MKLOOP_LINES=() MKLOOP_END=-1
+IB_CMD=()
+
+mkloop_check() {   # file -> 0 if its mkloop() is the known code; sets MKLOOP_LINES and MKLOOP_END
+    local i start=-1 n=0 text
+    MKLOOP_LINES=() MKLOOP_END=-1
+    [[ -r "$1" ]] && mapfile -t MKLOOP_LINES < "$1" || return 2
+    for i in "${!MKLOOP_LINES[@]}"; do
+        [[ "${MKLOOP_LINES[i]}" == "mkloop()" ]] && { n=$(( n + 1 )); start=$i; }
+    done
+    (( n == 1 )) || return 1
+    for (( i = start; i < ${#MKLOOP_LINES[@]}; i++ )); do
+        [[ "${MKLOOP_LINES[i]}" == "}" ]] && break
+    done
+    (( i < ${#MKLOOP_LINES[@]} )) || return 1
+    printf -v text '%s\n' "${MKLOOP_LINES[@]:start:i-start+1}"
+    [[ "${text%$'\n'}" == "$MKLOOP_KNOWN" ]] || return 1
+    MKLOOP_END=$i
+    return 0
+}
+
+prepare_image_backup() {   # sets IB_CMD: the patched copy in RAM, or image-backup as installed
+    local copy="$RUN_DIR/image-backup"
+    IB_CMD=("$IMAGE_BACKUP")
+    rm -f "$copy"
+    if ! mkloop_check "$IMAGE_BACKUP"; then
+        log "WARNING: image-backup's loop-device code is not the one this plugin knows - running it without the wait for the loop partitions"
+        return 0
+    fi
+    # run with bash, so a /run mounted noexec doesn't matter; only root can read the copy
+    if ( umask 077; printf '%s\n' "${MKLOOP_LINES[@]:0:MKLOOP_END}" "${MKLOOP_WAIT[@]}" \
+            "${MKLOOP_LINES[@]:MKLOOP_END}" > "$copy" ) \
+        && [[ "$(grep -c '^  # added by octopi-image-backup:' "$copy")" == 1 ]] \
+        && bash -n "$copy" 2>/dev/null; then
+        IB_CMD=(bash "$copy")
+    else
+        rm -f "$copy"
+        log "WARNING: could not add the wait for the loop partitions to image-backup - running it unchanged"
+    fi
+}
+
+cmd_check_image_backup() {   # for the plugin's tab, no root needed: ok | differs | missing
+    local ib
+    ib="$(find_image_backup)"
+    if [[ -z "$ib" || ! -r "$ib" ]]; then
+        echo missing
+    elif mkloop_check "$ib"; then
+        echo ok
+    else
+        echo differs
+    fi
+}
+
 prepare_destination() {   # mounts a share if needed, sets REAL_DEST, checks it is writable
     local t dir root_dev
 
@@ -944,13 +1023,14 @@ run_image_backup() {
         printf '%s\nupdate\n' "$FINAL" > "$WORK_STATE_FILE"
         log "Updating existing image $DISPLAY_FINAL"
     fi
-    log "Running: $IMAGE_BACKUP ${args[*]}"
+    prepare_image_backup
+    log "Running: $IMAGE_BACKUP ${args[*]}$( (( ${#IB_CMD[@]} > 1 )) && echo " (with the wait for the loop partitions)")"
 
     rm -f "$STEP_FILE" "$FS_INFO_FILE"
     IMG_FS_USED="" IMG_FS_TOTAL=""
     exec {out_fd}> >(image_backup_output "$extra")
     filter_pid=$!
-    "$IMAGE_BACKUP" "${args[@]}" < /dev/null 1>&"$out_fd" 2>&1 &
+    "${IB_CMD[@]}" "${args[@]}" < /dev/null 1>&"$out_fd" 2>&1 &
     BG_PID=$!
     while kill -0 "$BG_PID" 2>/dev/null; do
         progress_update
@@ -975,7 +1055,7 @@ run_image_backup() {
     if [[ -s "$FS_INFO_FILE" ]]; then
         read -r IMG_FS_USED IMG_FS_TOTAL < "$FS_INFO_FILE"
     fi
-    rm -f "$STEP_FILE" "$FS_INFO_FILE"
+    rm -f "$STEP_FILE" "$FS_INFO_FILE" "$RUN_DIR/image-backup"
     return $rc
 }
 
@@ -1497,8 +1577,9 @@ case "$CMD" in
     test-destination)   need_root; CMD="test"; cmd_test ;;
     set-credentials)    need_root; CMD="cred"; cmd_set_credentials ;;
     watch)              cmd_watch ;;
+    check-image-backup) cmd_check_image_backup ;;
     --version)          echo "$HELPER_VERSION" ;;
-    *)  echo "usage: $0 watch|run|recover|test-destination|set-credentials|--version" >&2
+    *)  echo "usage: $0 watch|check-image-backup|run|recover|test-destination|set-credentials|--version" >&2
         echo "watch: shows the progress of a running backup, as on the Pi's screen (no root needed)" >&2
         echo "(run and recover are normally started by octopi-image-backup.service)" >&2
         exit 2 ;;

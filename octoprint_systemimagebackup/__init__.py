@@ -33,7 +33,7 @@ STATUS_FILE = os.path.join(STATE_DIR, "status")
 LOG_FILE = os.path.join(STATE_DIR, "last.log")
 DEST_INFO_FILE = os.path.join(STATE_DIR, "dest-info")
 CRED_FILE = "/etc/octopi-image-backup/smb-credentials"
-EXPECTED_HELPER_VERSION = 10
+EXPECTED_HELPER_VERSION = 11
 
 SUDO = "/usr/bin/sudo"
 SYS_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -454,6 +454,11 @@ class SystemImageBackupPlugin(
                 return False
         return True
 
+    def _image_backup_check(self):
+        """Whether the helper can add its wait for the loop partitions to image-backup (no root needed)."""
+        rc, out = self._run([HELPER_PATH, "check-image-backup"], timeout=10)
+        return out.strip() if rc == 0 else "unknown"
+
     def _passwordless_sudo(self):
         rc, _ = self._run([SUDO, "-n", "true"], timeout=10)
         return rc == 0
@@ -500,6 +505,7 @@ class SystemImageBackupPlugin(
         if force:
             self._cache.pop("sudo_rule", None)
             self._cache.pop("sudo_nopasswd", None)
+            self._cache.pop("image_backup_check", None)
         info = {
             "installed": os.path.isfile(HELPER_PATH) and os.path.isfile(UNIT_PATH),
             "version": self._helper_version(),
@@ -508,6 +514,7 @@ class SystemImageBackupPlugin(
             "missing_tools": [],
             "sudo_rule": False,
             "problems": [],
+            "warnings": [],
         }
         for tool in ("rsync", "sgdisk"):
             if not shutil.which(tool, path=SYS_PATH):
@@ -536,6 +543,13 @@ class SystemImageBackupPlugin(
             info["problems"].append("Missing tools: " + ", ".join(info["missing_tools"]) + ".")
 
         info["ready"] = not info["problems"]
+        if info["ready"] and self._cached("image_backup_check", 300, self._image_backup_check) == "differs":
+            info["warnings"].append(
+                "image-backup on this Pi is not the version this plugin knows: its code for attaching the "
+                "image as a loop device differs. Backups still work, but without the extra wait that "
+                "prevents an occasional failure with \"special device /dev/loop…p2 does not exist\". "
+                "If that happens, start the backup again."
+            )
         info["install_command"] = self._install_command(with_image_utils=not info["image_backup"])
         info["can_install_from_ui"] = self._cached("sudo_nopasswd", 300, self._passwordless_sudo)
         return info
