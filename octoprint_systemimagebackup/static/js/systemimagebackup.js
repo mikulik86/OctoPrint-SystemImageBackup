@@ -120,6 +120,10 @@ $(function () {
             var h = self.helper();
             return h ? h.problems : [];
         });
+        self.imageBackupDiffers = ko.pureComputed(function () {
+            var h = self.helper();
+            return !!(h && h.image_backup_check === "differs");
+        });
         self.helperWarnings = ko.pureComputed(function () {
             var h = self.helper();
             return h && h.warnings ? h.warnings : [];
@@ -445,7 +449,12 @@ $(function () {
                 "The web interface is unavailable in the meantime" +
                 (self.showOnScreen() ? "; the Pi's screen shows the progress." : ".") +
                 "</p><p>To watch the backup over SSH, run this on the Pi:<br>" +
-                "<code>" + WATCH_COMMAND + "</code>";
+                "<code>" + WATCH_COMMAND + "</code>" +
+                (self.imageBackupDiffers()
+                    ? "</p><p class=\"text-warning\"><i class=\"fas fa-exclamation-triangle\"></i> " +
+                      "Note: image-backup on this Pi differs from the known version and runs without the " +
+                      "wait for the loop partitions. If the backup fails at the start, run it again."
+                    : "");
             showConfirmationDialog({
                 title: "Start system image backup?",
                 message: question,

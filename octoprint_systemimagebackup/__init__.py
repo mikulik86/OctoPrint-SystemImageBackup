@@ -543,7 +543,10 @@ class SystemImageBackupPlugin(
             info["problems"].append("Missing tools: " + ", ".join(info["missing_tools"]) + ".")
 
         info["ready"] = not info["problems"]
-        if info["ready"] and self._cached("image_backup_check", 300, self._image_backup_check) == "differs":
+        info["image_backup_check"] = (
+            self._cached("image_backup_check", 300, self._image_backup_check) if info["ready"] else None
+        )
+        if info["image_backup_check"] == "differs":
             info["warnings"].append(
                 "image-backup on this Pi is not the version this plugin knows: its code for attaching the "
                 "image as a loop device differs. Backups still work, but without the extra wait that "
