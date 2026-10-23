@@ -22,7 +22,7 @@
 # job file itself is writable by the OctoPrint user, so it is read as plain data and every
 # value is validated. Nothing from it is ever executed.
 
-HELPER_VERSION=8
+HELPER_VERSION=9
 
 set -o pipefail
 umask 022
@@ -38,6 +38,8 @@ NET_MOUNT_FILE="$STATE_DIR/net-mount"
 LOCK_FILE="$STATE_DIR/lock"
 STEP_FILE="$STATE_DIR/step"            # current step after copying, for the screen
 FS_INFO_FILE="$STATE_DIR/image-fs"     # used and total blocks of a new image's filesystem
+LIVE_FILE="$STATE_DIR/live"            # the progress view as on the Pi's screen, for "watch"
+UNIT_NAME="octopi-image-backup.service"
 CRED_DIR="${IB_CRED_DIR:-/etc/octopi-image-backup}"
 CRED_FILE="$CRED_DIR/smb-credentials"
 DEFAULTS_FILE="${IB_DEFAULTS_FILE:-/etc/default/octopi-image-backup}"
@@ -85,7 +87,7 @@ SCREEN_FD=""
 RETURN_VT=""
 OLD_BLANK=0
 S_CHECK=pending S_STOP=pending S_COPY=pending S_RESTART=pending
-D_STOP="" D_COPY="" D_RESTART="" FOOTER=""
+D_STOP="" D_COPY="" D_RESTART="" FOOTER="" FOOTER_LIVE=""
 
 # job values (defaults)
 J_DEST="" J_MODE="update" J_NAME="octopi-backup" J_KEEP=3 J_EXTRA=1024 J_FRESH=0
@@ -154,6 +156,8 @@ is_int() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )); }
 # --------------------------------------------------------------- screen ---
 # Progress on a spare text console (VT). OctoDash or whatever is shown keeps running on its
 # own console; we switch the display away and back.
+# The same view is also written to LIVE_FILE (with or without the screen option), where
+# "octopi-image-backup watch" shows it in a terminal, e.g. over SSH.
 
 vt_switch() {
     local n=$1
@@ -178,9 +182,8 @@ mark() {
     esac
 }
 
-screen_draw() {
-    (( SCREEN_ON )) || return 0
-    local now=$(( $(date +%s) - START_TS )) out
+screen_draw() {   # the progress view -> the Pi's screen (if on) and LIVE_FILE
+    local now=$(( $(date +%s) - START_TS )) out live tmp
     local el=$'\033[K\n'
     out=$'\033[H'
     out+="$el"
@@ -202,9 +205,19 @@ screen_draw() {
     [[ -n "$DISPLAY_FINAL" ]] && out+="  Image:    ${DISPLAY_FINAL}$el"
     out+="  Elapsed:  $(fmt_elapsed "$now")$el"
     out+="$el"
+    live="$out"
     [[ -n "$FOOTER" ]] && out+="  $FOOTER$el"
+    [[ -n "${FOOTER_LIVE:-$FOOTER}" ]] && live+="  ${FOOTER_LIVE:-$FOOTER}$el"
     out+=$'\033[J'
-    printf '%s' "$out" 1>&"$SCREEN_FD" 2>/dev/null || true
+    live+=$'\033[J'
+    if (( SCREEN_ON )); then
+        printf '%s' "$out" 1>&"$SCREEN_FD" 2>/dev/null || true
+    fi
+    # replaced in one step, so "watch" never reads half a frame; readable by everyone (umask)
+    tmp="$LIVE_FILE.tmp.$$"
+    if printf '%s' "$live" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$LIVE_FILE" 2>/dev/null || rm -f "$tmp"
+    fi
 }
 
 screen_open() {
@@ -1076,13 +1089,15 @@ on_exit() {
 
     if [[ "${ST[state]}" == success ]]; then
         FOOTER=$'\033[1;32mBackup finished.\033[0m Returning to the previous screen...'
+        FOOTER_LIVE=$'\033[1;32mBackup finished:\033[0m '"${ST[message]}"
         pause=$PAUSE_OK
     else
         FOOTER=$'\033[1;31mBackup FAILED:\033[0m '"${ST[message]}"
+        FOOTER_LIVE=""
         pause=$PAUSE_FAIL
     fi
+    screen_draw
     if (( SCREEN_ON )); then
-        screen_draw
         sleep "$pause"
         screen_close
     fi
@@ -1095,6 +1110,7 @@ cmd_run() {
     local rc size
     mkdir -p "$STATE_DIR" && chmod 0755 "$STATE_DIR"
     : > "$LOG_FILE"; chmod 0644 "$LOG_FILE"
+    rm -f "$LIVE_FILE"
     START_TS="$(date +%s)"
     ST=([state]=running [started]="$START_TS" [finished]="" [duration]="" [mode]="" [created]=""
         [image]="" [image_size]="" [message]="Backup running" [helper_version]="$HELPER_VERSION")
@@ -1108,7 +1124,7 @@ cmd_run() {
     read_job
     validate_job
     ST[mode]="$J_MODE"
-    S_CHECK=active
+    S_CHECK=active; screen_draw
     preflight
     S_CHECK=ok
     ST[image]="$DISPLAY_FINAL"
@@ -1265,6 +1281,37 @@ cmd_set_credentials() {   # stdin: user=..., password=... (or clear=1). Never lo
     echo "ok"
 }
 
+cmd_watch() {   # the progress view of a running backup in this terminal, e.g. over SSH; no root
+    local state running seen=0 since=0 mtime el=$'\033[K\n'
+    local head=$'\033[H'"$el"$'  \033[1mOctoPrint system image backup\033[0m'"$el  ================================$el$el"
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM HUP
+    printf '\033[?25l\033[H\033[2J'
+    while :; do
+        state="$(systemctl show -p ActiveState --value "$UNIT_NAME" 2>/dev/null)"
+        case "$state" in
+            activating|active|deactivating|reloading) running=1 ;;
+            *) running=0 ;;
+        esac
+        mtime="$(stat -c %Y "$LIVE_FILE" 2>/dev/null || echo 0)"
+        if (( running )); then
+            # a view left over from an earlier run is not shown (the new run replaces it)
+            if (( mtime >= since )) && cat "$LIVE_FILE" 2>/dev/null; then
+                seen=1
+            else
+                printf '%s' "$head  A backup is starting...$el"$'\033[J'
+            fi
+        elif (( seen )); then
+            cat "$LIVE_FILE" 2>/dev/null   # the final view: result and elapsed time
+            printf '\033[?25h\n'
+            return 0
+        else
+            since="$(date +%s)"
+            printf '%s' "$head  No backup is running. Waiting for one to start...$el  (Ctrl+C to stop watching)$el"$'\033[J'
+        fi
+        sleep 1
+    done
+}
+
 need_root() { [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }; }
 
 load_defaults() {   # systemd passes these via EnvironmentFile; sudo calls need them read here
@@ -1290,8 +1337,10 @@ case "$CMD" in
     recover)            need_root; cmd_recover ;;
     test-destination)   need_root; CMD="test"; cmd_test ;;
     set-credentials)    need_root; CMD="cred"; cmd_set_credentials ;;
+    watch)              cmd_watch ;;
     --version)          echo "$HELPER_VERSION" ;;
-    *)  echo "usage: $0 run|recover|test-destination|set-credentials|--version" >&2
+    *)  echo "usage: $0 watch|run|recover|test-destination|set-credentials|--version" >&2
+        echo "watch: shows the progress of a running backup, as on the Pi's screen (no root needed)" >&2
         echo "(run and recover are normally started by octopi-image-backup.service)" >&2
         exit 2 ;;
 esac

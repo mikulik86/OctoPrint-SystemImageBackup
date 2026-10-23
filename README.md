@@ -151,7 +151,7 @@ list of drives the Pi mounts at every boot:
 
 Then enter `/mnt/backup` as the folder in the plugin.
 
-### Progress on the Pi's screen (DSI/HDMI)
+### Progress on the Pi's screen (DSI/HDMI) or over SSH
 
 With *Show progress on the screen* on, the service switches the display to an unused text
 console (default 8) and shows each step, how much has been copied and the elapsed time. When
@@ -159,12 +159,19 @@ OctoPrint answers again, it switches back to the previous screen, e.g. OctoDash,
 running in the background the whole time. After a failure, the error stays on screen for 30 s
 first.
 
-Without a screen, leave the option off. You can follow a running backup over SSH with this
-command. The tab shows it under the Start button, with a Copy button:
+Without a screen, leave the option off.
+
+To watch a backup over SSH, with or without a screen, run this on the Pi. The tab shows it
+under the Start button, with a Copy button:
 
 ```
-journalctl -u octopi-image-backup -f
+/usr/local/sbin/octopi-image-backup watch
 ```
+
+It shows the same view as the Pi's screen. If no backup is running yet, it waits for one, so
+you can start it before clicking **Start backup now**. It ends by itself with the result.
+Ctrl+C stops watching, not the backup. It doesn't need sudo. The full log of a running backup
+is also in the system journal: `journalctl -u octopi-image-backup -f`.
 
 ### OctoDash Custom Action
 
@@ -238,6 +245,9 @@ Your image files are never touched.
 
 ## Changelog
 
+- **0.4.4** – Watch a running backup over SSH with `/usr/local/sbin/octopi-image-backup watch`:
+  the same view as on the Pi's screen, with or without the screen option. The tab shows this
+  command instead of the journalctl one. Click **Update helper** after updating.
 - **0.4.3** – The tab shows the SSH command for following a running backup, with a Copy button.
 - **0.4.2** – Clearer log: each step after copying (four filesystem checks, shrinking, adding
   the room for updates) is one plain line, in the right order, and the log ends with what the

@@ -114,12 +114,13 @@
             <div class="sib-small sib-start-hint" data-bind="text: startHint"></div>
             <div class="sib-follow">
                 <p class="sib-small">
-                    This page is offline while the backup runs. To follow it over SSH, run this on the Pi
-                    (Ctrl+C stops watching, not the backup):
+                    This page is offline while the backup runs. To watch it over SSH, run this on the Pi.
+                    It shows the same as the Pi's screen and ends with the result. You can start it before
+                    clicking Start backup now; it waits for the backup. Ctrl+C stops watching, not the backup.
                 </p>
                 <div class="sib-cmd">
-                    <pre>journalctl -u octopi-image-backup -f</pre>
-                    <button class="btn btn-mini" data-bind="click: function() { copy('journalctl -u octopi-image-backup -f') }" title="Copy">
+                    <pre>/usr/local/sbin/octopi-image-backup watch</pre>
+                    <button class="btn btn-mini" data-bind="click: function() { copy('/usr/local/sbin/octopi-image-backup watch') }" title="Copy">
                         <i class="fas fa-copy"></i> Copy
                     </button>
                 </div>
